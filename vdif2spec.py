@@ -82,7 +82,7 @@ def main():
     args = parser.parse_args()
     ifile = args.ifile
     fft = args.fft
-    skip_time = args.skip
+    skip = args.skip
     length = args.length
     bit = args.bit
     bw = args.bw
@@ -95,13 +95,17 @@ def main():
         elif 0.0 < fft_check < 1.0 :
             print("Please select a power-of-2 number (e.g. 1024, 8192, 1048576)")
             exit(1)
-    
+    if skip >= length :
+        print(f"This program can not has \"skip ({skip} s)\" larger than \"length ({length} s)\"")
+        exit(1)
+        
+        
     # スペクトルの積算用配列を確保
     integrated_spectrum = np.zeros(args.fft // 2)
     
     # 並列処理のセットアップ
     with mp.Pool(args.cpu) as pool:
-        tasks = read_vdif_chunks(ifile, fft, skip_time, length, bit)
+        tasks = read_vdif_chunks(ifile, fft, skip, length, bit)
         for spectrum in pool.imap_unordered(process_fft, tasks):
             integrated_spectrum += spectrum  # メモリ節約しながら加算
     
@@ -133,4 +137,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
