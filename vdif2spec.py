@@ -9,7 +9,6 @@ import multiprocessing as mp
 import matplotlib.pyplot as plt
 import os, sys 
 
-
 #plt.rcParams["font.family"] = "Times New Roman"
 plt.rcParams["xtick.direction"]     = "in"       
 plt.rcParams["ytick.direction"]     = "in"       
@@ -29,14 +28,16 @@ plt.rcParams["axes.labelsize"]      = 15
 plt.rcParams["font.size"]           = 12
 
 
-
-def read_vdif_chunks(filename, fft_size, length, bit_depth):
+def read_vdif_chunks(filename, fft_size, skip_time, length, bit_depth):
     """
-    VDIF データを 1 秒ごとに読み込むジェネレーター
+    VDIF データをスキップ時間分スキップし、指定時間分読み込むジェネレーター
     """
     data_size = 256 * 1024 * 1024  # 1 秒あたり 256 MB
     
     with open(filename, 'rb') as f:
+        # 指定した時間分スキップ
+        f.seek(data_size * skip_time, os.SEEK_SET)
+        
         for _ in range(length):
             raw_data = np.frombuffer(f.read(data_size), dtype=np.uint8)
             if len(raw_data) < data_size:
@@ -72,6 +73,7 @@ def main():
     parser = argparse.ArgumentParser(description='VDIF FFT Spectrum Analyzer')
     parser.add_argument('--ifile' , type=str, required=True, help='Input VDIF file')
     parser.add_argument('--fft'   , type=int, default=4096, help='FFT size (power of 2)')
+    parser.add_argument('--skip'  , type=int, default=0   , help='Skip time (seconds)')
     parser.add_argument('--length', type=int, default=1   , help='Integration time (seconds)')
     parser.add_argument('--bit'   , type=int, default=2   , help='Bit depth per sample')
     parser.add_argument('--bw'    , type=int, default=512 , help='BandWidth (MHz)')
@@ -80,6 +82,7 @@ def main():
     args = parser.parse_args()
     ifile = args.ifile
     fft = args.fft
+    skip_time = args.skip
     length = args.length
     bit = args.bit
     bw = args.bw
@@ -98,7 +101,7 @@ def main():
     
     # 並列処理のセットアップ
     with mp.Pool(args.cpu) as pool:
-        tasks = read_vdif_chunks(ifile, fft, length, bit)
+        tasks = read_vdif_chunks(ifile, fft, skip_time, length, bit)
         for spectrum in pool.imap_unordered(process_fft, tasks):
             integrated_spectrum += spectrum  # メモリ節約しながら加算
     
