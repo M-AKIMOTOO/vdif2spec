@@ -69,6 +69,12 @@ def process_fft(data_chunk):
     spectrum = np.abs(scipy.fft.fft(data_chunk))[:fft_size // 2]
     return spectrum
 
+def moving_average(data, window_size):
+    """
+    移動平均を計算する
+    """
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+
 def main():
     parser = argparse.ArgumentParser(description='VDIF FFT Spectrum Analyzer')
     parser.add_argument('--ifile' , type=str, required=True, help='Input VDIF file')
@@ -78,7 +84,8 @@ def main():
     parser.add_argument('--bit'   , type=int, default=2   , help='Bit depth per sample')
     parser.add_argument('--bw'    , type=int, default=512 , help='BandWidth (MHz)')
     parser.add_argument('--cpu'   , type=int, default=4   , help='Number of CPU cores')
-    parser.add_argument('--output', action="store_true"   , help='Output spectraum data')
+    parser.add_argument('--output', action="store_true"   , help='Output spectrum data')
+    parser.add_argument('--avg'   , type=int, default=5   , help='Moving average window size')
         
     args = parser.parse_args()
     ifile = args.ifile
@@ -88,20 +95,21 @@ def main():
     bit = args.bit
     bw = args.bw
     output = args.output
+    avg_window = args.avg
     
-    fft_check = fft
-    while True :
-        fft_check /= 2
-        if fft_check == 1.0 :
-            break
-        elif 0.0 < fft_check < 1.0 :
-            print("Please select a power-of-2 number (e.g. 1024, 8192, 1048576)")
-            exit(1)
-    if skip >= length :
-        print(f"This program can not has \"skip ({skip} s)\" larger than \"length ({length} s)\"")
-        exit(1)
-        
-        
+    print("#--------------------#")
+    print("# Inputed Parameters #")
+    print("#                    #")
+    print(f"  File        : {ifile}")
+    print(f"  FFT         : {fft}")
+    print(f"  Skip (sec)  : {skip}")
+    print(f"  Length (sec): {length}")
+    print(f"  Bit         : {bit}")
+    print(f"  BW (MHz)    : {bw}")
+    print(f"  Output txt  : {output}")
+    print(f"  moveing avg : {avg_window}")
+    print("#--------------------#")
+    
     # スペクトルの積算用配列を確保
     integrated_spectrum = np.zeros(args.fft // 2)
     
@@ -113,31 +121,65 @@ def main():
     
     # 規格化
     integrated_spectrum /= fft
+    integrated_spectrum *= length
     integrated_spectrum[0] = 0.0
-
-    bw_freq = np.linspace(0,bw,fft//2)
     
-    # txt に保存
-    if output :
-        txt_filename = os.path.splitext(ifile)[0] + '_spectrum.txt'
-        np.savetxt(txt_filename, np.column_stack([np.round(bw_freq,10), np.round(integrated_spectrum,10)]), delimiter=' ', header='#Frequency,Amplitude', comments='')
-    else : pass
+    bw_freq = np.linspace(0, bw, fft//2)
+    
+    # 移動平均の計算
+    smoothed_spectrum = moving_average(integrated_spectrum, avg_window)
+    
+    bw_freq_smooth = bw_freq[:len(smoothed_spectrum)]
     
     # PDF に保存
-    pdf_filename = os.path.splitext(ifile)[0] + '_spectrum.pdf'
+    pdf_filename = os.path.splitext(ifile)[0] + '_spec.pdf'
     plt.figure(figsize=(9,6))
-    plt.plot(bw_freq, integrated_spectrum, "-", label='Spectrum')
+    plt.plot(bw_freq[1:], integrated_spectrum[1:], "-", label='Spectrum')
+    plt.plot(bw_freq_smooth[1:], smoothed_spectrum[1:], "--", label='Moving Average')
     plt.xlabel('Frequency (MHz)')
     plt.ylabel('Power')
     plt.xlim(xmin=0.0)
-    plt.ylim(ymin=0.0)
     plt.legend()
     plt.tight_layout()
     plt.savefig(pdf_filename)
-    plt.show()
+    #plt.show()
     plt.close()
     
-    print(f'Spectrum saved: {txt_filename}, {pdf_filename}')
+    print(f'Spectrum saved: {pdf_filename}')
+    
+    
+    # 標準偏差を計算し、5σ以上のデータを抽出
+    std_dev = np.std(smoothed_spectrum)
+    mean    = np.mean(smoothed_spectrum)
+    threshold = 5 * std_dev
+
+    significant_indices = np.where(smoothed_spectrum > threshold+mean)[0]
+    if len(significant_indices) != 0 :
+
+        significant_indices = int(np.mean(significant_indices))
+        
+        # 高強度成分を別の Figure にプロット
+        center_freq = bw_freq[significant_indices]
+        freq_range = (bw_freq >= center_freq - 3) & (bw_freq <= center_freq + 3)
+        smoothed_center_freq = bw_freq_smooth[significant_indices]
+        smoothed_freq_range = (bw_freq_smooth >= smoothed_center_freq - 3) & (bw_freq_smooth <= smoothed_center_freq + 3)
+
+        pdf_filename = os.path.splitext(ifile)[0] + '_peak.pdf'
+        plt.figure(figsize=(9,6))
+        plt.plot(bw_freq[freq_range], integrated_spectrum[freq_range], "-", c="tab:red", label='Spectrum')
+        plt.plot(bw_freq_smooth[smoothed_freq_range], smoothed_spectrum[smoothed_freq_range], "--", c="tab:green", label='Moving Average')
+        plt.xlabel('Frequency (MHz)')
+        plt.ylabel('Power')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(pdf_filename)
+        #plt.show()
+        plt.close()
+
+        print(f'Spectrum saved: {pdf_filename}')
+    else :
+        pass
 
 if __name__ == '__main__':
     main()
+
