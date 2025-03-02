@@ -118,7 +118,7 @@ def main():
     bw_freq = np.linspace(0,bw,fft//2)
     
     # txt に保存
-    if output == True :
+    if output :
         txt_filename = os.path.splitext(ifile)[0] + '_spectrum.txt'
         np.savetxt(txt_filename, np.column_stack([np.round(bw_freq,10), np.round(integrated_spectrum,10)]), delimiter=' ', header='#Frequency,Amplitude', comments='')
     else : pass
