@@ -3,9 +3,11 @@ use std::io::{BufWriter, Write, Read, Seek, SeekFrom, Error, ErrorKind};
 use fftw::array::AlignedVec;
 use fftw::plan::*;
 use fftw::types::Flag;
-use gnuplot::{Figure, AxesCommon, Color, LineStyle, Dash, Fix};
+use gnuplot::{Figure, AxesCommon, Fix};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle}; // indicatif クレートのインポート
+use std::path::{Path, PathBuf};
+
 
 #[derive(Parser)]
 #[command(
@@ -52,19 +54,6 @@ fn moving_average(data: &[f32], window_size: usize) -> Vec<f32> {
     data.windows(window_size).map(|window| window.iter().sum::<f32>() / window_size as f32).collect()
 }
 
-fn convole(data: &[f32], window: &[f32]) -> Vec<f32> {
-    let mut result = vec![0.0; data.len()];
-
-    for i in 0..data.len() {
-        for j in 0..window.len() {
-            if i + j < data.len() {
-                result[i+j] += data[i] * window[j];
-            }
-        }
-    }
-    result
-}
-
 fn process_vdif_frames(filename: &str, fft_size: usize, skip_time: usize, length: usize, bit_depth: u8) -> Result<impl Iterator<Item = Vec<f32>>, Error> {
     let mut file = File::open(filename)?;
     let data_size = 256 * 1024 * 1024; // 1 秒あたり 256 MB
@@ -77,7 +66,7 @@ fn process_vdif_frames(filename: &str, fft_size: usize, skip_time: usize, length
         let mut buffer = vec![0u8; data_size];
         match file.read_exact(&mut buffer) {
             Ok(_) => {
-                let decoded_data = decode_vdif_data(&buffer, bit_depth, fft_size);
+                let decoded_data = decode_vdif_data(&buffer, bit_depth);
                 let chunked_data = decoded_data.chunks(fft_size).map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
                 chunked_data.into_iter().map(|x|x).collect::<Vec<_>>()
             }
@@ -87,7 +76,7 @@ fn process_vdif_frames(filename: &str, fft_size: usize, skip_time: usize, length
     Ok(data_frames_iter)
 }
 
-fn decode_vdif_data(raw_data: &[u8], bit_depth: u8, fft_size: usize) -> Vec<f32> {
+fn decode_vdif_data(raw_data: &[u8], bit_depth: u8) -> Vec<f32> {
     let mask = (1 << bit_depth) - 1; // 例: 2-bit -> 0b11 (3)
     let samples_per_byte = (8 / bit_depth) as usize; // 例: 2-bit -> 4 samples/byte
     let total_samples = raw_data.len() * samples_per_byte;
@@ -127,7 +116,11 @@ impl FFTProcessor {
     }
 }
 
-fn plot_spectrum(freqs: &[f32], spectrum: &[f32], filename: &str, smooth_spectrum: Option<&[f32]>, xmin: f64, xmax: f64) {
+fn plot_spectrum(freqs: &[f32], spectrum: &[f32], filename: &str, average: usize, xmin: f64, xmax: f64) {
+
+    let smoothed_freqs: Vec<f32> = moving_average(&freqs, average);
+    let smoothed_spectrum: Vec<f32> = moving_average(&spectrum, average);
+
     let mut fg = Figure::new();
     let axes = fg.axes2d()
         .set_x_label("Frequency (MHz)", &[])
@@ -135,9 +128,7 @@ fn plot_spectrum(freqs: &[f32], spectrum: &[f32], filename: &str, smooth_spectru
         .set_y_label("Power", &[]);
 
     axes.lines(freqs, spectrum, &[gnuplot::Caption("Spectrum"), gnuplot::LineWidth(2.0)]);
-    if let Some(smoothed) = smooth_spectrum {
-        axes.lines(&freqs[..smoothed.len()], smoothed, &[gnuplot::Caption("Moving Average"), gnuplot::LineWidth(2.0)]);
-    }
+    axes.lines(smoothed_freqs, smoothed_spectrum, &[gnuplot::Caption("Moving Average"), gnuplot::LineWidth(2.0)]);
 
     fg.save_to_png(filename, 800, 600).expect("Failed to save plot");
 
@@ -149,6 +140,18 @@ fn is_power_of_two(n: usize) -> bool {
         return false;
     }
     (n & (n - 1)) == 0
+}
+
+fn filepath(path_str: &str) -> PathBuf {
+    let path = Path::new(path_str);
+
+    // 拡張子を除いたパスを取得
+    let mut base_path = path.to_path_buf();
+    if path.extension().is_some() {
+        base_path.set_extension("");
+    }
+
+    base_path
 }
 
 fn main() -> Result<(), Error> {
@@ -184,6 +187,11 @@ fn main() -> Result<(), Error> {
     println!("  moveing avg : {}", args.avg);
     println!("#--------------------#");
     
+
+    let base_path = filepath(&args.ifile);
+    let base_path = base_path.to_string_lossy();
+
+
     // プログレスバーの初期化
     let pb = ProgressBar::new(args.length as u64);
     pb.set_style(
@@ -206,75 +214,38 @@ fn main() -> Result<(), Error> {
         pb.inc(1);
     });
 
-    // 移動平均の計算
-    let smoothed_spectrum: Vec<f32> = moving_average(&integrated_spectrum, args.avg);
-
     // 周波数軸の生成 (DC 成分を除外)
     let freq_step = args.bw / (args.fft as f32 / 2.0);
     let freqs: Vec<f32> = (1..args.fft / 2).map(|i| i as f32 * freq_step).collect();
     
     // スペクトルプロット
-    plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_spec.png", args.ifile), Some(&smoothed_spectrum), 0.0, args.bw as f64);
+    plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_spec.png", base_path), args.avg, 0.0, args.bw as f64);
     
     if args.fmin != 0.0 || args.fmax != 512.0 {
-        plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_peak.png", args.ifile), Some(&smoothed_spectrum), args.fmin, args.fmax);
+        plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_peak.png", base_path), args.avg, args.fmin, args.fmax);
     }
 
     // スペクトルデータのテキスト出力
     if args.output {
-        let filename = format!("{}_spec.txt", args.ifile);
+        let filename = format!("{}_spec.txt", base_path);
         let file = File::create(&filename)?;
-        let mut writer = BufWriter::new(file);
+        let mut ofile = BufWriter::new(file);
 
-        writeln!(writer, "# Frequency(MHz) Spectrum")?;
+        writeln!(ofile, "# VDIF FFT Spectrum Analyzer Data")?;
+        writeln!(ofile, "# Inputed Parameters")?;
+        writeln!(ofile, "# File        : {}", args.ifile)?;
+        writeln!(ofile, "# FFT         : {}", args.fft)?;
+        writeln!(ofile, "# Skip (sec)  : {}", args.skip)?;
+        writeln!(ofile, "# Length (sec): {}", args.length)?;
+        writeln!(ofile, "# Bit         : {}", args.bit)?;
+        writeln!(ofile, "# BW (MHz)    : {}", args.bw)?;
+        writeln!(ofile, "# moveing avg : {}", args.avg)?;
+        writeln!(ofile, "# Frequency(MHz) Spectrum")?;
         for (f, s) in freqs.iter().zip(integrated_spectrum.iter()) {
-            writeln!(writer, "{:.6} {:.6}", f, s)?;
+            writeln!(ofile, "{:.6} {:.6}", f, s)?;
         }
         println!("Spectrum data saved to: {}", filename);
     }
-
-    // プログレスバーを終了
-    // /pb.finish_with_message("Processing complete");
-
-    /* 
-    // 標準偏差を計算し、5σ以上のデータを抽出
-    let std_dev = (integrated_spectrum.iter().map(|&x| x * x).sum::<f32>() / (integrated_spectrum.len() as f32) - integrated_spectrum.iter().sum::<f32>().powi(2) / (integrated_spectrum.len() as f32).powi(2)).sqrt();
-    let mean = integrated_spectrum.iter().sum::<f32>() / integrated_spectrum.len() as f32;
-    let threshold = 5.0 * std_dev;
-
-    let significant_indices: Vec<usize> = smoothed_spectrum.iter().enumerate().filter(|(i, &s)| s > threshold+mean).map(|(i, _)| i).collect();
-
-    if !significant_indices.is_empty() {
-        //ピークを抽出
-        let mut significant_spectrum: Vec<f32> = Vec::new();
-        let mut significant_spectrum_smooth: Vec<f32> = Vec::new();
-
-        for index in significant_indices.iter(){
-            significant_spectrum.push(integrated_spectrum[*index]);
-            significant_spectrum_smooth.push(smoothed_spectrum[*index]);
-        }
-        let significant_indices_avg = if significant_indices.is_empty() {
-            0.0
-        } else {
-            significant_indices.iter().map(|&x| x as f32).sum::<f32>() / significant_indices.len() as f32
-        };
-
-        //ピークがある周波数を特定
-        let significant_freq_index = significant_indices_avg.round() as usize;
-        let center_freq = freqs[significant_freq_index];
-
-        // 周波数帯域を絞る
-        let start_freq = (center_freq - 3.0);
-        let end_freq = (center_freq + 3.0);
-
-        let start_index = freqs.iter().position(|&f| f >= start_freq).unwrap_or(0);
-        let end_index = freqs.iter().position(|&f| f >= end_freq).unwrap_or(freqs.len());
-
-        // ピーク付近をプロット
-        plot_spectrum(&freqs[start_index..end_index], &integrated_spectrum[start_index..end_index], &format!("{}_peak.png", args.ifile),Some(&smoothed_spectrum[start_index..end_index]));
-    }
-    */
-
 
     Ok(())
 }

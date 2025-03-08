@@ -12,4 +12,4 @@ fftw = { version = "0.8", features = ["system"] }
 gnuplot = "0.0.37"
 clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"
-find_peaks = "0.1.5"
+
