@@ -1,4 +1,4 @@
-Recommended RAM = 32 GB or more
+Recommended RAM is 32 GB or more
 
 # Rust Version
 cargo run --release
