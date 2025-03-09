@@ -45,6 +45,9 @@ struct Cli {
     
     #[arg(long, default_value = "512.0", help = "Maximum of frequency")]
     fmax: f64,
+
+    #[arg(long, default_value = "octadisk", help = "Recording type (octadisk or vsrec)")]
+    rec: String,
 }
 
 fn moving_average(data: &[f32], window_size: usize) -> Vec<f32> {
@@ -54,29 +57,109 @@ fn moving_average(data: &[f32], window_size: usize) -> Vec<f32> {
     data.windows(window_size).map(|window| window.iter().sum::<f32>() / window_size as f32).collect()
 }
 
-fn process_vdif_frames(filename: &str, fft_size: usize, skip_time: usize, length: usize, bit_depth: u8) -> Result<impl Iterator<Item = Vec<f32>>, Error> {
-    let mut file = File::open(filename)?;
+fn process_vdif_frames(filename: &str, fft_size: usize, skip_time: usize, length: usize, bit_depth: u8, bit_shuffle: bool) -> Result<impl Iterator<Item = Vec<f32>>, Error> {
+    
+    let file = File::open(filename)?;
     let data_size = 256 * 1024 * 1024; // 1 秒あたり 256 MB
 
     let skip_byte = data_size * skip_time;
     // スキップ処理
+    let mut file = std::io::BufReader::new(file);
     file.seek(SeekFrom::Start(skip_byte as u64))?;
 
-    let data_frames_iter = (0..length).flat_map(move |_| {
+    let data_frames_iter = (0..length).map(move |_| {
         let mut buffer = vec![0u8; data_size];
-        match file.read_exact(&mut buffer) {
+            match file.read_exact(&mut buffer) {
             Ok(_) => {
-                let decoded_data = decode_vdif_data(&buffer, bit_depth);
-                let chunked_data = decoded_data.chunks(fft_size).map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
-                chunked_data.into_iter().map(|x|x).collect::<Vec<_>>()
+                        decode_vdif_data(&buffer, bit_depth, bit_shuffle)
+                            .chunks(fft_size)
+                            .map(|chunk| chunk.to_vec())
+                            .collect::<Vec<_>>()
             }
             Err(_) => vec![], // エラー時は空の Vec を返す
         }
-    }).filter(|x| !x.is_empty());
+    }).flat_map(|chunks| chunks.into_iter());
     Ok(data_frames_iter)
 }
 
-fn decode_vdif_data(raw_data: &[u8], bit_depth: u8) -> Vec<f32> {
+fn bit_shuffle(data: &mut [u8]) {
+    for chunk in data.chunks_mut(4) {
+        if chunk.len() == 4 {
+            let original = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let shuffled = shuffle_bits(original);
+            let shuffled_bytes = shuffled.to_le_bytes();
+            chunk.copy_from_slice(&shuffled_bytes);
+        }
+    }
+}
+
+fn shuffle_bits(original: u32) -> u32 {
+    let mut shuffled = 0;
+    shuffled |= (original >> 24) & 0xFF; // 24-31
+    shuffled |= ((original >> 16) & 0xFF) << 8; // 16-23
+    shuffled |= ((original >> 8) & 0xFF) << 16; // 8-15
+    shuffled |= (original & 0xFF) << 24; // 0-7
+
+    let mut result = 0u32;
+    //24,25,26,27,28,29,30,31
+    result |= ((shuffled >> 24) & 0xFF) << 24; //24-31->24-31
+    //16,17,18,19,20,21,22,23
+    result |= ((shuffled >> 16) & 0xFF) << 16; //16-23->16-23
+    //8,9,10,11,12,13,14,15
+    result |= ((shuffled >> 8) & 0xFF) << 8; //8-15->8-15
+    //0,1,2,3,4,5,6,7
+    result |= (shuffled & 0xFF) << 0; //0-7 ->0-7
+
+    let mut new_result = 0u32;
+
+    new_result |= ((result >> 31) & 0x01) << 24;//31->24
+    new_result |= ((result >> 30) & 0x01) << 25;//30->25
+    new_result |= ((result >> 29) & 0x01) << 26;//29->26
+    new_result |= ((result >> 28) & 0x01) << 27;//28->27
+    new_result |= ((result >> 27) & 0x01) << 28;//27->28
+    new_result |= ((result >> 26) & 0x01) << 29;//26->29
+    new_result |= ((result >> 25) & 0x01) << 30;//25->30
+    new_result |= ((result >> 24) & 0x01) << 31;//24->31
+
+    new_result |= ((result >> 23) & 0x01) << 16;//23->16
+    new_result |= ((result >> 22) & 0x01) << 17;//22->17
+    new_result |= ((result >> 21) & 0x01) << 18;//21->18
+    new_result |= ((result >> 20) & 0x01) << 19;//20->19
+    new_result |= ((result >> 19) & 0x01) << 20;//19->20
+    new_result |= ((result >> 18) & 0x01) << 21;//18->21
+    new_result |= ((result >> 17) & 0x01) << 22;//17->22
+    new_result |= ((result >> 16) & 0x01) << 23;//16->23
+
+    new_result |= ((result >> 15) & 0x01) << 8;//15->8
+    new_result |= ((result >> 14) & 0x01) << 9;//14->9
+    new_result |= ((result >> 13) & 0x01) << 10;//13->10
+    new_result |= ((result >> 12) & 0x01) << 11;//12->11
+    new_result |= ((result >> 11) & 0x01) << 12;//11->12
+    new_result |= ((result >> 10) & 0x01) << 13;//10->13
+    new_result |= ((result >> 9) & 0x01) << 14;//9->14
+    new_result |= ((result >> 8) & 0x01) << 15;//8->15
+
+    new_result |= ((result >> 7) & 0x01) << 0;//7->0
+    new_result |= ((result >> 6) & 0x01) << 1;//6->1
+    new_result |= ((result >> 5) & 0x01) << 2;//5->2
+    new_result |= ((result >> 4) & 0x01) << 3;//4->3
+    new_result |= ((result >> 3) & 0x01) << 4;//3->4
+    new_result |= ((result >> 2) & 0x01) << 5;//2->5
+    new_result |= ((result >> 1) & 0x01) << 6;//1->6
+    new_result |= ((result >> 0) & 0x01) << 7;//0->7
+    
+    new_result
+}
+
+
+fn decode_vdif_data(raw_data: &[u8], bit_depth: u8, rec_vsrec: bool) -> Vec<f32> {
+
+    let mut data = raw_data.to_vec();
+    if rec_vsrec {
+        bit_shuffle(&mut data);
+    }
+    let raw_data = &data;
+    
     let mask = (1 << bit_depth) - 1; // 例: 2-bit -> 0b11 (3)
     let samples_per_byte = (8 / bit_depth) as usize; // 例: 2-bit -> 4 samples/byte
     let total_samples = raw_data.len() * samples_per_byte;
@@ -172,7 +255,16 @@ fn main() -> Result<(), Error> {
             format!("Skip value ({}) cannot be greater than length ({})", args.skip, args.length),
         ));
     }
-    
+
+    // rec の値が正しいかチェック
+    if args.rec != "octadisk" && args.rec != "vsrec" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("rec value must be 'octadisk' or 'vsrec', but got {}", args.rec),
+        ));
+    }
+
+    let rec_vsrec = args.rec == "vsrec";
 
     println!("#--------------------#");
     println!("# Inputed Parameters #");
@@ -184,7 +276,9 @@ fn main() -> Result<(), Error> {
     println!("  Bit         : {}", args.bit);
     println!("  BW (MHz)    : {}", args.bw);
     println!("  Output txt  : {}", args.output);
-    println!("  moveing avg : {}", args.avg);
+    println!("  Moveing avg : {}", args.avg);
+    println!("  Recorder    : {}", args.rec);
+    println!("  Bit shuffle : {}", rec_vsrec);
     println!("#--------------------#");
     
 
@@ -206,14 +300,14 @@ fn main() -> Result<(), Error> {
 
     let mut fft_processor = FFTProcessor::new(args.fft);
 
-    let processed_spectra = process_vdif_frames(&args.ifile, args.fft, args.skip, args.length, args.bit)?;
-    processed_spectra.map(|chunk| fft_processor.process(&chunk)).for_each(|spectrum|{
-        for (i, val) in spectrum.iter().enumerate() {
-            integrated_spectrum[i] += val / (args.fft as f32 * args.length as f32);
-        }
-        pb.inc(1);
-    });
-
+    let data_frames = process_vdif_frames(&args.ifile, args.fft, args.skip, args.length, args.bit, rec_vsrec)?;
+    for frame in data_frames {
+      let spectrum = fft_processor.process(&frame);
+      for (i, val) in spectrum.iter().enumerate() {
+          integrated_spectrum[i] += val / (args.fft as f32 * args.length as f32);
+      }
+      pb.inc(1);
+    };
     // 周波数軸の生成 (DC 成分を除外)
     let freq_step = args.bw / (args.fft as f32 / 2.0);
     let freqs: Vec<f32> = (1..args.fft / 2).map(|i| i as f32 * freq_step).collect();
