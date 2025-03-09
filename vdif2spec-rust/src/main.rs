@@ -225,16 +225,19 @@ fn is_power_of_two(n: usize) -> bool {
     (n & (n - 1)) == 0
 }
 
-fn filepath(path_str: &str) -> PathBuf {
+fn filepath(path_str: &str) -> (PathBuf, String) {
     let path = Path::new(path_str);
 
-    // 拡張子を除いたパスを取得
-    let mut base_path = path.to_path_buf();
-    if path.extension().is_some() {
-        base_path.set_extension("");
-    }
+    // ファイル名を取得（拡張子を含む）
+    //let file_name_with_ext = path.file_name().and_then(|name| name.to_str()).unwrap_or("").to_string();
 
-    base_path
+    // 拡張子を除いたファイル名を取得
+    let file_name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("").to_string();
+
+    // パスからファイル名を除いた部分を取得
+    let parent_path = path.parent().unwrap_or(Path::new("")).to_path_buf();
+
+    (parent_path, file_name)
 }
 
 fn main() -> Result<(), Error> {
@@ -282,8 +285,16 @@ fn main() -> Result<(), Error> {
     println!("#--------------------#");
     
 
-    let base_path = filepath(&args.ifile);
-    let base_path = base_path.to_string_lossy();
+    let (parent_path, file_name) = filepath(&args.ifile);
+    let output_dir = parent_path.join("vdif2spec");
+
+    // ディレクトリが存在しない場合にのみ作成
+    if !output_dir.exists() {
+        std::fs::create_dir_all(&output_dir)?;
+    }
+    let base_path_buf = output_dir.join(file_name);
+    let base_path = base_path_buf.to_string_lossy();
+
 
 
     // プログレスバーの初期化
@@ -313,15 +324,15 @@ fn main() -> Result<(), Error> {
     let freqs: Vec<f32> = (1..args.fft / 2).map(|i| i as f32 * freq_step).collect();
     
     // スペクトルプロット
-    plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_spec.png", base_path), args.avg, 0.0, args.bw as f64);
+    plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_vdif2spec_spec.png", base_path), args.avg, 0.0, args.bw as f64);
     
     if args.fmin != 0.0 || args.fmax != 512.0 {
-        plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_peak.png", base_path), args.avg, args.fmin, args.fmax);
+        plot_spectrum(&freqs, &integrated_spectrum, &format!("{}_vdif2spec_peak.png", base_path), args.avg, args.fmin, args.fmax);
     }
 
     // スペクトルデータのテキスト出力
     if args.output {
-        let filename = format!("{}_spec.txt", base_path);
+        let filename = format!("{}_vdif2spec_spec.txt", base_path);
         let file = File::create(&filename)?;
         let mut ofile = BufWriter::new(file);
 
