@@ -313,12 +313,17 @@ fn main() -> Result<(), Error> {
 
     let data_frames = process_vdif_frames(&args.ifile, args.fft, args.skip, args.length, args.bit, rec_vsrec)?;
     for frame in data_frames {
-      let spectrum = fft_processor.process(&frame);
-      for (i, val) in spectrum.iter().enumerate() {
-          integrated_spectrum[i] += val / (args.fft as f32 * args.length as f32);
-      }
-      pb.inc(1);
+        let spectrum = fft_processor.process(&frame);
+        for (i, val) in spectrum.iter().enumerate() {
+            integrated_spectrum[i] += val / (args.fft as f32 * args.length as f32);
+        }
+        pb.inc(1);
     };
+    
+    if !rec_vsrec {
+        integrated_spectrum.reverse();
+    }
+    
     // 周波数軸の生成 (DC 成分を除外)
     let freq_step = args.bw / (args.fft as f32 / 2.0);
     let freqs: Vec<f32> = (1..args.fft / 2).map(|i| i as f32 * freq_step).collect();
