@@ -62,7 +62,7 @@ struct Cli {
     #[arg(long, value_name = "SEC", help = "Processing length [s]")]
     length: Option<f64>,
 
-    #[arg(long = "loop", default_value_t = 0, value_name = "N", help = "Max FFT frame count to integrate (0 = no limit)")]
+    #[arg(long = "loop", default_value_t = 0, value_name = "N", help = "Number of output segments. Each segment spans --length seconds (0 = single output)")]
     loop_count: usize,
 
     #[arg(long, default_value_t = 2, value_name = "BITS", help = "Bit depth [bits/sample]")]
@@ -276,7 +276,7 @@ fn decode_block_into_with_plan(
     Ok(())
 }
 
-fn resolve_plot_path(vdif: &Path) -> PathBuf {
+fn resolve_plot_path(vdif: &Path, segment_idx: usize, segment_total: u64) -> PathBuf {
     let parent = vdif
         .parent()
         .map(|p| p.to_path_buf())
@@ -286,18 +286,45 @@ fn resolve_plot_path(vdif: &Path) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("spectrum");
-    out_dir.join(format!("{stem}_vdif2spec_spec.png"))
+    if segment_total <= 1 {
+        out_dir.join(format!("{stem}_vdif2spec_spec.png"))
+    } else {
+        out_dir.join(format!("{stem}_vdif2spec_spec_loop{:04}.png", segment_idx + 1))
+    }
 }
 
-fn resolve_text_path(vdif: &Path, out_opt: &Option<String>) -> Option<PathBuf> {
+fn with_loop_suffix(path: &Path, segment_idx: usize) -> PathBuf {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let mut out = path.to_path_buf();
+    let ext = path.extension().and_then(|e| e.to_str());
+    match ext {
+        Some(ext) if !ext.is_empty() => out.set_file_name(format!("{stem}_loop{:04}.{ext}", segment_idx + 1)),
+        _ => out.set_file_name(format!("{stem}_loop{:04}", segment_idx + 1)),
+    }
+    out
+}
+
+fn resolve_text_path(
+    vdif: &Path,
+    out_opt: &Option<String>,
+    segment_idx: usize,
+    segment_total: u64,
+) -> Option<PathBuf> {
     match out_opt {
         None => None,
         Some(s) if s == OUTPUT_AUTO_SENTINEL => {
-            let mut p = resolve_plot_path(vdif);
+            let mut p = resolve_plot_path(vdif, segment_idx, segment_total);
             p.set_extension("txt");
             Some(p)
         }
-        Some(s) => Some(PathBuf::from(s)),
+        Some(s) => {
+            let p = PathBuf::from(s);
+            if segment_total <= 1 {
+                Some(p)
+            } else {
+                Some(with_loop_suffix(&p, segment_idx))
+            }
+        }
     }
 }
 
@@ -489,6 +516,12 @@ fn main() -> Result<(), IoError> {
             return Err(IoError::new(ErrorKind::InvalidInput, "--length must be > 0"));
         }
     }
+    if cli.loop_count > 0 && cli.length.is_none() {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--loop requires --length",
+        ));
+    }
     if cli.cpu == 0 {
         return Err(IoError::new(ErrorKind::InvalidInput, "--cpu must be >= 1"));
     }
@@ -568,16 +601,26 @@ fn main() -> Result<(), IoError> {
     } else {
         available_frames
     };
-    let loop_frames = if cli.loop_count == 0 {
-        u64::MAX
+    let segment_frames = if cli.loop_count == 0 {
+        length_frames.min(available_frames)
     } else {
-        cli.loop_count as u64
+        length_frames
     };
-    let process_frames = available_frames.min(length_frames).min(loop_frames);
-    if process_frames == 0 {
+    if segment_frames == 0 {
         return Err(IoError::new(
             ErrorKind::UnexpectedEof,
-            "nothing to process (0 frames)",
+            "nothing to process (0 frames per segment)",
+        ));
+    }
+    let segment_total = if cli.loop_count == 0 {
+        1u64
+    } else {
+        (cli.loop_count as u64).min(available_frames / segment_frames)
+    };
+    if segment_total == 0 {
+        return Err(IoError::new(
+            ErrorKind::UnexpectedEof,
+            "requested loop segments exceed available input length",
         ));
     }
 
@@ -628,7 +671,8 @@ fn main() -> Result<(), IoError> {
     }
     println!("  loop             : {}", cli.loop_count);
     println!("  cpu              : {}", cli.cpu);
-    println!("  process frames   : {}", process_frames);
+    println!("  frames/segment   : {}", segment_frames);
+    println!("  segments         : {}", segment_total);
 
     let mut reader = BufReader::new(File::open(&cli.vdif)?);
     reader.seek(SeekFrom::Start(skip_bytes))?;
@@ -642,95 +686,101 @@ fn main() -> Result<(), IoError> {
     let mut in_chunk = vec![0u8; chunk_frames * frame_bytes];
     let input_lsb = cli.sideband == Sideband::Lsb;
 
-    let mut integrated = vec![0.0f32; half_bins];
-    let mut done_frames = 0u64;
+    for seg_idx in 0..segment_total as usize {
+        let mut integrated = vec![0.0f32; half_bins];
+        let mut done_frames = 0u64;
 
-    while done_frames < process_frames {
-        let this_chunk = ((process_frames - done_frames) as usize).min(chunk_frames);
-        let in_bytes = this_chunk * frame_bytes;
-        reader.read_exact(&mut in_chunk[..in_bytes])?;
+        while done_frames < segment_frames {
+            let this_chunk = ((segment_frames - done_frames) as usize).min(chunk_frames);
+            let in_bytes = this_chunk * frame_bytes;
+            reader.read_exact(&mut in_chunk[..in_bytes])?;
 
-        let chunk_accum = pool
-            .install(|| -> Result<Vec<f32>, DynError> {
-                in_chunk[..in_bytes]
-                    .par_chunks(frame_bytes)
-                    .try_fold(
-                        || (FftWorker::new(cli.fft), vec![0.0f32; half_bins]),
-                        |(mut worker, mut acc), raw_frame| {
-                            decode_block_into_with_plan(
-                                raw_frame,
-                                &levels,
-                                cli.fft,
-                                &decode_plan,
-                                &mut worker.time,
-                                input_lsb,
-                            )?;
-                            worker.forward.process(&mut worker.time, &mut worker.spec)?;
-                            for (dst, src) in acc.iter_mut().zip(worker.spec.iter()) {
-                                *dst += src.norm_sqr();
-                            }
-                            Ok((worker, acc))
-                        },
-                    )
-                    .map(|res| res.map(|(_, acc)| acc))
-                    .try_reduce(
-                        || vec![0.0f32; half_bins],
-                        |mut a, b| {
-                            for (dst, src) in a.iter_mut().zip(b.iter()) {
-                                *dst += *src;
-                            }
-                            Ok(a)
-                        },
-                    )
-            })
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+            let chunk_accum = pool
+                .install(|| -> Result<Vec<f32>, DynError> {
+                    in_chunk[..in_bytes]
+                        .par_chunks(frame_bytes)
+                        .try_fold(
+                            || (FftWorker::new(cli.fft), vec![0.0f32; half_bins]),
+                            |(mut worker, mut acc), raw_frame| {
+                                decode_block_into_with_plan(
+                                    raw_frame,
+                                    &levels,
+                                    cli.fft,
+                                    &decode_plan,
+                                    &mut worker.time,
+                                    input_lsb,
+                                )?;
+                                worker.forward.process(&mut worker.time, &mut worker.spec)?;
+                                for (dst, src) in acc.iter_mut().zip(worker.spec.iter()) {
+                                    *dst += src.norm_sqr();
+                                }
+                                Ok((worker, acc))
+                            },
+                        )
+                        .map(|res| res.map(|(_, acc)| acc))
+                        .try_reduce(
+                            || vec![0.0f32; half_bins],
+                            |mut a, b| {
+                                for (dst, src) in a.iter_mut().zip(b.iter()) {
+                                    *dst += *src;
+                                }
+                                Ok(a)
+                            },
+                        )
+                })
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
 
-        for (dst, src) in integrated.iter_mut().zip(chunk_accum.iter()) {
-            *dst += *src;
-        }
+            for (dst, src) in integrated.iter_mut().zip(chunk_accum.iter()) {
+                *dst += *src;
+            }
 
-        done_frames += this_chunk as u64;
-        if done_frames % cli.progress_every == 0 || done_frames == process_frames {
-            let pct = (done_frames as f64 / process_frames as f64) * 100.0;
-            print!("\r  progress         : {done_frames}/{process_frames} frames ({pct:.2}%)");
-            std::io::stdout().flush()?;
-            if done_frames == process_frames {
-                println!();
+            done_frames += this_chunk as u64;
+            if done_frames % cli.progress_every == 0 || done_frames == segment_frames {
+                let pct = (done_frames as f64 / segment_frames as f64) * 100.0;
+                print!(
+                    "\r  progress [{}/{}]  : {done_frames}/{segment_frames} frames ({pct:.2}%)",
+                    seg_idx + 1,
+                    segment_total
+                );
+                std::io::stdout().flush()?;
+                if done_frames == segment_frames {
+                    println!();
+                }
             }
         }
-    }
 
-    let mut norm = integrated.iter().map(|&v| v as f64).sum::<f64>();
-    norm *= process_frames as f64;
-    let inv = if norm > 0.0 { (1.0 / norm) as f32 } else { 1.0f32 };
-    for v in &mut integrated {
-        *v *= inv;
-    }
+        let mut norm = integrated.iter().map(|&v| v as f64).sum::<f64>();
+        norm *= segment_frames as f64;
+        let inv = if norm > 0.0 { (1.0 / norm) as f32 } else { 1.0f32 };
+        for v in &mut integrated {
+            *v *= inv;
+        }
 
-    let mut freqs_mhz = Vec::with_capacity(end_bin - start_bin);
-    let mut power = Vec::with_capacity(end_bin - start_bin);
-    for k in start_bin..end_bin {
-        let freq = k as f64 * bw_half_mhz / half_bins as f64;
-        freqs_mhz.push(freq);
-        power.push(integrated[k]);
-    }
+        let mut freqs_mhz = Vec::with_capacity(end_bin - start_bin);
+        let mut power = Vec::with_capacity(end_bin - start_bin);
+        for k in start_bin..end_bin {
+            let freq = k as f64 * bw_half_mhz / half_bins as f64;
+            freqs_mhz.push(freq);
+            power.push(integrated[k]);
+        }
 
-    let plot_path = resolve_plot_path(&cli.vdif);
-    plot_spectrum(&freqs_mhz, &power, &plot_path, (selected_low, selected_high))
-        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-    println!("  plot             : {}", plot_path.display());
+        let plot_path = resolve_plot_path(&cli.vdif, seg_idx, segment_total);
+        plot_spectrum(&freqs_mhz, &power, &plot_path, (selected_low, selected_high))
+            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+        println!("  plot             : {}", plot_path.display());
 
-    if let Some(txt_path) = resolve_text_path(&cli.vdif, &cli.output) {
-        save_spectrum_text(
-            &txt_path,
-            &freqs_mhz,
-            &power,
-            &cli,
-            (selected_low, selected_high),
-            process_frames,
-        )
-        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
-        println!("  output txt       : {}", txt_path.display());
+        if let Some(txt_path) = resolve_text_path(&cli.vdif, &cli.output, seg_idx, segment_total) {
+            save_spectrum_text(
+                &txt_path,
+                &freqs_mhz,
+                &power,
+                &cli,
+                (selected_low, selected_high),
+                segment_frames,
+            )
+            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+            println!("  output txt       : {}", txt_path.display());
+        }
     }
 
     println!("  done             : {}", cli.vdif.display());
