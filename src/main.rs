@@ -154,6 +154,7 @@ struct DecodePlan {
 
 struct ByteDecodeLut {
     samples_per_byte: usize,
+    table_plain: Box<[[f32; 8]; 256]>,
     table_even: Box<[[f32; 8]; 256]>,
     table_odd: Box<[[f32; 8]; 256]>,
 }
@@ -162,17 +163,18 @@ struct FftWorker {
     forward: Arc<dyn RealToComplex<f32>>,
     time: Vec<f32>,
     spec: Vec<Complex<f32>>,
+    accum: Vec<f32>,
 }
 
 impl FftWorker {
-    fn new(fft: usize) -> Self {
-        let mut planner = RealFftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(fft);
+    fn new(forward: Arc<dyn RealToComplex<f32>>, half_bins: usize) -> Self {
+        let fft = forward.len();
         let spec = forward.make_output_vec();
         Self {
             forward,
             time: vec![0.0; fft],
             spec,
+            accum: vec![0.0; half_bins],
         }
     }
 }
@@ -236,7 +238,11 @@ fn resolve_shuffle(values: &[usize]) -> Result<Vec<usize>, DynError> {
     Ok(values_internal)
 }
 
-fn build_decode_plan(bits: usize, shuffle_in: &[usize]) -> Result<DecodePlan, DynError> {
+fn build_decode_plan(
+    bits: usize,
+    shuffle_in: &[usize],
+    levels: &[f32],
+) -> Result<DecodePlan, DynError> {
     if shuffle_in.len() != 32 {
         return Err("internal shuffle map must have 32 entries".into());
     }
@@ -256,7 +262,7 @@ fn build_decode_plan(bits: usize, shuffle_in: &[usize]) -> Result<DecodePlan, Dy
         ShuffleKind::Generic
     };
 
-    let byte_lut = build_byte_decode_lut(bits, shuffle_kind);
+    let byte_lut = build_byte_decode_lut(bits, shuffle_kind, levels);
 
     Ok(DecodePlan {
         bits,
@@ -266,13 +272,18 @@ fn build_decode_plan(bits: usize, shuffle_in: &[usize]) -> Result<DecodePlan, Dy
     })
 }
 
-fn build_byte_decode_lut(bits: usize, shuffle_kind: ShuffleKind) -> Option<ByteDecodeLut> {
+fn build_byte_decode_lut(
+    bits: usize,
+    shuffle_kind: ShuffleKind,
+    levels: &[f32],
+) -> Option<ByteDecodeLut> {
     if bits == 0 || bits > 8 || (8 % bits) != 0 {
         return None;
     }
 
     let samples_per_byte = 8 / bits;
     let code_mask = (1u16 << bits) - 1;
+    let mut table_plain = [[0.0f32; 8]; 256];
     let mut table_even = [[0.0f32; 8]; 256];
     let mut table_odd = [[0.0f32; 8]; 256];
 
@@ -285,15 +296,19 @@ fn build_byte_decode_lut(bits: usize, shuffle_kind: ShuffleKind) -> Option<ByteD
 
         for sample_idx in 0..samples_per_byte {
             let shift = sample_idx * bits;
-            let code = ((source >> shift) & code_mask) as f32;
+            let code = ((source >> shift) & code_mask) as usize;
+            let value = levels[code];
+            table_plain[byte as usize][sample_idx] = value;
             table_even[byte as usize][sample_idx] =
-                if (sample_idx & 1) == 1 { -code } else { code };
-            table_odd[byte as usize][sample_idx] = if (sample_idx & 1) == 0 { -code } else { code };
+                if (sample_idx & 1) == 1 { -value } else { value };
+            table_odd[byte as usize][sample_idx] =
+                if (sample_idx & 1) == 0 { -value } else { value };
         }
     }
 
     Some(ByteDecodeLut {
         samples_per_byte,
+        table_plain: Box::new(table_plain),
         table_even: Box::new(table_even),
         table_odd: Box::new(table_odd),
     })
@@ -312,7 +327,7 @@ fn decode_block_into_with_plan(
     }
 
     if let Some(lut) = plan.byte_lut.as_ref() {
-        return decode_block_with_byte_lut(raw, levels, samples, plan, output, lsb_to_usb, lut);
+        return decode_block_with_byte_lut(raw, samples, plan, output, lsb_to_usb, lut);
     }
 
     let bits = plan.bits;
@@ -360,7 +375,6 @@ fn decode_block_into_with_plan(
 
 fn decode_block_with_byte_lut(
     raw: &[u8],
-    levels: &[f32],
     samples: usize,
     plan: &DecodePlan,
     output: &mut [f32],
@@ -382,20 +396,17 @@ fn decode_block_with_byte_lut(
         };
 
         for &byte in &bytes {
-            let table = if lsb_to_usb && (out_idx & 1) == 1 {
+            let table = if !lsb_to_usb {
+                &lut.table_plain
+            } else if (out_idx & 1) == 1 {
                 &lut.table_odd
             } else {
                 &lut.table_even
             };
             let decoded = &table[byte as usize];
-            for &code in decoded[..lut.samples_per_byte].iter() {
+            for &value in decoded[..lut.samples_per_byte].iter() {
                 if out_idx >= samples {
                     break;
-                }
-                let code_idx = code.abs() as usize;
-                let mut value = levels[code_idx];
-                if lsb_to_usb && code.is_sign_negative() {
-                    value = -value;
                 }
                 output[out_idx] = value;
                 out_idx += 1;
@@ -471,10 +482,10 @@ fn resolve_text_path(
 }
 
 fn plot_spectrum(
-    freqs_mhz: &[f64],
+    freqs_mhz: &[f32],
     power: &[f32],
     out_png: &Path,
-    if_range_mhz: (f64, f64),
+    if_range_mhz: (f32, f32),
 ) -> Result<(), DynError> {
     if freqs_mhz.is_empty() || power.is_empty() || freqs_mhz.len() != power.len() {
         return Err("no spectrum points to plot".into());
@@ -486,17 +497,8 @@ fn plot_spectrum(
         }
     }
 
-    let y_min_raw = power
-        .iter()
-        .copied()
-        .map(f64::from)
-        .fold(f64::INFINITY, f64::min)
-        .min(0.0);
-    let y_max_raw = power
-        .iter()
-        .copied()
-        .map(f64::from)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let y_min_raw = power.iter().copied().fold(f32::INFINITY, f32::min).min(0.0);
+    let y_max_raw = power.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let (y_min, y_max) = if y_max_raw > y_min_raw {
         let pad = (y_max_raw - y_min_raw) * 0.05;
         (y_min_raw - pad, y_max_raw + pad)
@@ -504,7 +506,7 @@ fn plot_spectrum(
         (y_min_raw - 1.0, y_min_raw + 1.0)
     };
 
-    let font_scale = 1.3_f64;
+    let font_scale = 1.3_f32;
     let caption_size = 28_i32;
     let axis_desc_size = (24.0 * font_scale).round() as i32;
     let tick_label_size = (18.0 * font_scale).round() as i32;
@@ -521,7 +523,7 @@ fn plot_spectrum(
         .y_label_area_size(y_label_area)
         .build_cartesian_2d(if_range_mhz.0..if_range_mhz.1, y_min..y_max)?;
 
-    let yfmt = |y: &f64| format!("{y:.1e}");
+    let yfmt = |y: &f32| format!("{y:.1e}");
     chart
         .configure_mesh()
         .x_desc("IF Frequency (MHz)")
@@ -533,10 +535,7 @@ fn plot_spectrum(
         .draw()?;
 
     chart.draw_series(LineSeries::new(
-        freqs_mhz
-            .iter()
-            .zip(power.iter())
-            .map(|(&f, &p)| (f, p as f64)),
+        freqs_mhz.iter().zip(power.iter()).map(|(&f, &p)| (f, p)),
         &BLUE,
     ))?;
 
@@ -597,10 +596,10 @@ fn quantize_png_in_place(path: &Path) -> Result<(), DynError> {
 
 fn save_spectrum_text(
     path: &Path,
-    freqs_mhz: &[f64],
+    freqs_mhz: &[f32],
     power: &[f32],
     cli: &Cli,
-    if_range: (f64, f64),
+    if_range: (f32, f32),
     frames: u64,
 ) -> Result<(), DynError> {
     if let Some(parent) = path.parent() {
@@ -725,7 +724,7 @@ fn main() -> Result<(), IoError> {
     } else {
         cli.shuffle.clone()
     };
-    let decode_plan = build_decode_plan(cli.bit, &shuffle)
+    let decode_plan = build_decode_plan(cli.bit, &shuffle, &levels)
         .map_err(|e| IoError::new(ErrorKind::InvalidInput, e.to_string()))?;
 
     let frame_bits = cli.fft * cli.bit;
@@ -839,10 +838,16 @@ fn main() -> Result<(), IoError> {
         .num_threads(cli.cpu)
         .build()
         .map_err(|e| IoError::new(ErrorKind::Other, format!("failed to configure rayon: {e}")))?;
+    let mut planner = RealFftPlanner::<f32>::new();
+    let forward = planner.plan_fft_forward(cli.fft);
 
     let chunk_frames = (cli.progress_every as usize).max(cli.cpu * 16).max(1);
     let mut in_chunk = vec![0u8; chunk_frames * frame_bytes];
     let input_lsb = cli.sideband == Sideband::Lsb;
+    let freqs_mhz: Vec<f32> = (start_bin..end_bin)
+        .map(|k| (k as f32) * (bw_half_mhz as f32) / (half_bins as f32))
+        .collect();
+    let if_range_selected = (selected_low as f32, selected_high as f32);
 
     for seg_idx in 0..segment_total as usize {
         let mut integrated = vec![0.0f32; half_bins];
@@ -858,8 +863,8 @@ fn main() -> Result<(), IoError> {
                     in_chunk[..in_bytes]
                         .par_chunks(frame_bytes)
                         .try_fold(
-                            || (FftWorker::new(cli.fft), vec![0.0f32; half_bins]),
-                            |(mut worker, mut acc), raw_frame| {
+                            || FftWorker::new(forward.clone(), half_bins),
+                            |mut worker, raw_frame| {
                                 decode_block_into_with_plan(
                                     raw_frame,
                                     &levels,
@@ -869,13 +874,13 @@ fn main() -> Result<(), IoError> {
                                     input_lsb,
                                 )?;
                                 worker.forward.process(&mut worker.time, &mut worker.spec)?;
-                                for (dst, src) in acc.iter_mut().zip(worker.spec.iter()) {
+                                for (dst, src) in worker.accum.iter_mut().zip(worker.spec.iter()) {
                                     *dst += src.norm_sqr();
                                 }
-                                Ok((worker, acc))
+                                Ok(worker)
                             },
                         )
-                        .map(|res| res.map(|(_, acc)| acc))
+                        .map(|res| res.map(|worker| worker.accum))
                         .try_reduce(
                             || vec![0.0f32; half_bins],
                             |mut a, b| {
@@ -907,33 +912,17 @@ fn main() -> Result<(), IoError> {
             }
         }
 
-        let mut norm = integrated.iter().map(|&v| v as f64).sum::<f64>();
-        norm *= segment_frames as f64;
-        let inv = if norm > 0.0 {
-            (1.0 / norm) as f32
-        } else {
-            1.0f32
-        };
+        let norm = integrated.iter().copied().sum::<f32>() * segment_frames as f32;
+        let inv = if norm > 0.0 { 1.0f32 / norm } else { 1.0f32 };
         for v in &mut integrated {
             *v *= inv;
         }
 
-        let mut freqs_mhz = Vec::with_capacity(end_bin - start_bin);
-        let mut power = Vec::with_capacity(end_bin - start_bin);
-        for k in start_bin..end_bin {
-            let freq = k as f64 * bw_half_mhz / half_bins as f64;
-            freqs_mhz.push(freq);
-            power.push(integrated[k]);
-        }
+        let power = integrated[start_bin..end_bin].to_vec();
 
         let plot_path = resolve_plot_path(&cli.vdif, seg_idx, segment_total);
-        plot_spectrum(
-            &freqs_mhz,
-            &power,
-            &plot_path,
-            (selected_low, selected_high),
-        )
-        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+        plot_spectrum(&freqs_mhz, &power, &plot_path, if_range_selected)
+            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
         println!("  plot             : {}", plot_path.display());
 
         if let Some(txt_path) = resolve_text_path(&cli.vdif, &cli.output, seg_idx, segment_total) {
@@ -942,7 +931,7 @@ fn main() -> Result<(), IoError> {
                 &freqs_mhz,
                 &power,
                 &cli,
-                (selected_low, selected_high),
+                if_range_selected,
                 segment_frames,
             )
             .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
