@@ -15,3 +15,10 @@ realfft = "3.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.17"
 imagequant = "4"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
