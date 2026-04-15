@@ -1,30 +1,77 @@
-Recommended RAM is 32 GB or more
+# vdif2spec
 
-# Rust Version
-cargo run --release
+VDIF/raw の周波数スペクトルを作成します。
 
-[package]
-name = "vdif2spec"  
-version = "0.1.0"  
-edition = "2021"  
-rust-version = "1.85"  
-authors = ["Masanori AKIMOTO"]  
-description = "This program make a spectrum graph of a VDIF format. cargo version: 1.85.0 (d73d2caf9 2024-12-31)，rustc version: 1.85.0 (4d91de4e4 2025-02-17)，rustup version : 1.27.1 (54dd3d00f 2024-04-24)"  
+- 復号は `phased_array` / `vdif_chN_spliter` と同系統（`--bit`, `--level`, `--shuffle`, `--sideband`）
+- 周波数軸は `0 .. --bw/2 [MHz]`
+- `--if LOW-HIGH` で IF 範囲を抽出
+- `--cpu` で Rayon 並列実行
 
+## Build
 
-[dependencies]
-fftw = { version = "0.8", features = ["system"] }  
-gnuplot = "0.0.37"  
-clap = { version = "4.4", features = ["derive"] }  
-indicatif = "0.17"  
-find_peaks = "0.1.5"  
+```bash
+cargo build --release
+```
 
-# Python Version
-Python 3.10  
+## Usage
 
-import argparse  
-import numpy as np  
-import scipy.fft  
-import multiprocessing as mp  
-import matplotlib.pyplot as plt  
-import os, sys   
+```bash
+vdif2spec --vdif <FILE> [OPTIONS]
+```
+
+主要オプション:
+
+- `--vdif <FILE>`: 入力 VDIF/raw
+- `--fft <N>`: FFT 点数（2 のべき乗）
+- `--skip <SEC>`: 先頭からスキップ秒
+- `--length <SEC>`: 処理時間
+- `--loop <N>`: `--length` 秒ごとの出力セグメント数（`0` で単一出力）
+- `--bit <BITS>`: 量子化 bit 数
+- `--level <L0> <L1> ...`: 量子化レベル（code order、個数は `2^bit`）
+- `--shuffle <B31> ... <B0>`: ビットシャッフル（32 個、`0..31` の置換）
+- `--vsrec`: `--level`/`--shuffle` を VSREC 固定値へ強制上書き
+- `--bw <MHz>`: サンプリング帯域（スペクトル表示は `0..bw/2`）
+- `--if <LOW> <HIGH>`: IF 抽出範囲
+- `--sideband <USB|LSB>`: 入力 sideband
+- `--cpu <N>`: Rayon スレッド数
+- `-o, --output [FILE]`: テキスト保存
+
+## Output
+
+PNG は常に出力されます:
+
+- `<input_dir>/vdif2spec/<stem>_vdif2spec_spec.png`
+- `--loop > 0` のときは `<stem>_vdif2spec_spec_loop0001.png` のように連番出力
+- 生成後に `imagequant` で自動減色（indexed PNG 化）し、ファイル容量を最小化します
+
+テキスト出力 (`frequency[MHz] power[a.u.]`) は `-o/--output` 指定時のみ:
+
+- `-o`（引数なし）: `plot` と同じディレクトリ・同じ stem の `.txt`
+- `-o <FILE>`: 指定ファイル名
+- `--loop > 0` のときは `.txt` も `_loop0001` 連番になります
+
+## Examples
+
+全帯域（`0..bw/2`）:
+
+```bash
+./target/release/vdif2spec \
+  --vdif ./test/HITACH32_2024058103800.vdif2spec \
+  --fft 4096 --bw 1024 --bit 2 --sideband LSB --cpu 4
+```
+
+IF 抽出 + 自動テキスト名（plot と同じ場所）:
+
+```bash
+./target/release/vdif2spec \
+  --vdif ./test/HITACH32_2024058103800.vdif2spec \
+  --fft 4096 --bw 1024 --if 60 100 --length 1 --loop 5 --cpu 4 -o
+```
+
+IF 抽出 + 任意テキスト名:
+
+```bash
+./target/release/vdif2spec \
+  --vdif ./test/HITACH32_2024058103800.vdif2spec \
+  --fft 4096 --bw 1024 --if 60 100 --output ./spec.txt
+```
