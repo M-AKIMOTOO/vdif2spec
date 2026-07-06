@@ -5,6 +5,7 @@ VDIF/raw の周波数スペクトルを作成します。
 - 復号は `phased_array` / `vdif_chN_spliter` と同系統（`--bit`, `--level`, `--shuffle`, `--sideband`）
 - 周波数軸は `0 .. --bw/2 [MHz]`
 - `--if LOW-HIGH` で IF 範囲を抽出
+- `--bptable FILE` でチャンネルごとのバンドパス較正
 - `--cpu` で Rayon 並列実行
 
 ## Build
@@ -32,6 +33,7 @@ vdif2spec --vdif <FILE> [OPTIONS]
 - `--vsrec`: `--level`/`--shuffle` を VSREC 固定値へ強制上書き
 - `--bw <MHz>`: サンプリング帯域（スペクトル表示は `0..bw/2`）
 - `--if <LOW> <HIGH>`: IF 抽出範囲
+- `--bptable <FILE>`: 2列テキストのバンドパステーブルで `power / bandpass` 較正
 - `--sideband <USB|LSB>`: 入力 sideband
 - `--cpu <N>`: Rayon スレッド数
 - `-o, --output [FILE]`: テキスト保存
@@ -49,6 +51,18 @@ PNG は常に出力されます:
 - `-o`（引数なし）: `plot` と同じディレクトリ・同じ stem の `.txt`
 - `-o <FILE>`: 指定ファイル名
 - `--loop > 0` のときは `.txt` も `_loop0001` 連番になります
+
+## Bandpass calibration
+
+`--bptable` は `--output` で生成したものと同じ、空白区切りの2列テキストを読み込みます。`#` から始まる行と行末コメントは無視されます。
+
+```text
+# Frequency(MHz) Power(a.u.)
+60.000000000 1.234000000e-5
+60.250000000 1.210000000e-5
+```
+
+較正値は各チャンネルの `power / bandpass` です。データとテーブルのチャンネル幅が異なる場合は、細かい側を周波数ビンの重なり幅で加重平均し、粗い側のグリッドへ rebin します。出力は両者が完全に重なる周波数チャンネルに限定されます。
 
 ## Examples
 
@@ -74,4 +88,13 @@ IF 抽出 + 任意テキスト名:
 ./target/release/vdif2spec \
   --vdif ./test/HITACH32_2024058103800.vdif2spec \
   --fft 4096 --bw 1024 --if 60 100 --output ./spec.txt
+```
+
+バンドパス較正 + テキスト出力:
+
+```bash
+./target/release/vdif2spec \
+  --vdif ./test/HITACH32_2024058103800.vdif2spec \
+  --fft 4096 --bw 1024 --if 60 100 \
+  --bptable ./bandpass.txt --output ./calibrated.txt
 ```

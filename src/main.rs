@@ -8,7 +8,9 @@ use realfft::{RealFftPlanner, RealToComplex};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Error as IoError, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{
+    BufRead, BufReader, BufWriter, Error as IoError, ErrorKind, Read, Seek, SeekFrom, Write,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,6 +109,13 @@ struct Cli {
 
     #[arg(long = "if", allow_hyphen_values = true, num_args = 2, value_names = ["LOW", "HIGH"], help = "IF range [MHz] to extract inside 0..bw/2")]
     if_range: Option<Vec<f64>>,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Bandpass table (frequency[MHz] value); calibrate by channel-wise division"
+    )]
+    bptable: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = Sideband::Lsb, help = "Input sideband convention")]
     sideband: Sideband,
@@ -481,6 +490,227 @@ fn resolve_text_path(
     }
 }
 
+#[derive(Clone, Debug)]
+struct Spectrum {
+    freqs_mhz: Vec<f32>,
+    values: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebinDirection {
+    None,
+    BandpassToData,
+    DataToBandpass,
+}
+
+impl fmt::Display for RebinDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RebinDirection::None => write!(f, "none"),
+            RebinDirection::BandpassToData => write!(f, "bandpass -> data grid"),
+            RebinDirection::DataToBandpass => write!(f, "data -> bandpass grid"),
+        }
+    }
+}
+
+fn read_spectrum_table(path: &Path) -> Result<Spectrum, DynError> {
+    let reader = BufReader::new(File::open(path)?);
+    parse_spectrum_table(reader, &path.display().to_string())
+}
+
+fn parse_spectrum_table<R: BufRead>(reader: R, source: &str) -> Result<Spectrum, DynError> {
+    let mut freqs_mhz = Vec::new();
+    let mut values = Vec::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let data = line.split_once('#').map_or(line.as_str(), |(head, _)| head);
+        let mut columns = data.split_whitespace();
+        let Some(freq_raw) = columns.next() else {
+            continue;
+        };
+        let value_raw = columns
+            .next()
+            .ok_or_else(|| format!("{source}:{}: expected frequency and value", line_idx + 1))?;
+        let freq = freq_raw.parse::<f32>().map_err(|e| {
+            format!(
+                "{source}:{}: invalid frequency '{freq_raw}': {e}",
+                line_idx + 1
+            )
+        })?;
+        let value = value_raw.parse::<f32>().map_err(|e| {
+            format!(
+                "{source}:{}: invalid value '{value_raw}': {e}",
+                line_idx + 1
+            )
+        })?;
+        if !freq.is_finite() || !value.is_finite() {
+            return Err(format!("{source}:{}: values must be finite", line_idx + 1).into());
+        }
+        if freqs_mhz.last().is_some_and(|&previous| freq <= previous) {
+            return Err(format!(
+                "{source}:{}: frequencies must be strictly increasing",
+                line_idx + 1
+            )
+            .into());
+        }
+        freqs_mhz.push(freq);
+        values.push(value);
+    }
+
+    if freqs_mhz.len() < 2 {
+        return Err(format!("{source}: at least two spectrum rows are required").into());
+    }
+
+    Ok(Spectrum { freqs_mhz, values })
+}
+
+fn bin_edges(freqs_mhz: &[f32]) -> Result<Vec<f32>, DynError> {
+    if freqs_mhz.len() < 2 {
+        return Err("at least two frequency channels are required".into());
+    }
+
+    let mut edges = Vec::with_capacity(freqs_mhz.len() + 1);
+    edges.push(freqs_mhz[0] - (freqs_mhz[1] - freqs_mhz[0]) * 0.5);
+    for pair in freqs_mhz.windows(2) {
+        if pair[1] <= pair[0] {
+            return Err("frequency channels must be strictly increasing".into());
+        }
+        edges.push((pair[0] + pair[1]) * 0.5);
+    }
+    let last = freqs_mhz.len() - 1;
+    edges.push(freqs_mhz[last] + (freqs_mhz[last] - freqs_mhz[last - 1]) * 0.5);
+    Ok(edges)
+}
+
+fn mean_channel_width(freqs_mhz: &[f32]) -> f32 {
+    (freqs_mhz[freqs_mhz.len() - 1] - freqs_mhz[0]) / (freqs_mhz.len() - 1) as f32
+}
+
+fn same_frequency_grid(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() || a.len() < 2 {
+        return false;
+    }
+    let channel_tolerance = mean_channel_width(a).abs().min(mean_channel_width(b).abs()) * 1.0e-3;
+    a.iter().zip(b).all(|(&left, &right)| {
+        let rounding_tolerance = f32::EPSILON * left.abs().max(right.abs()).max(1.0) * 4.0;
+        (left - right).abs() <= channel_tolerance.max(rounding_tolerance)
+    })
+}
+
+fn rebin_onto(source: &Spectrum, target_freqs_mhz: &[f32]) -> Result<Vec<Option<f32>>, DynError> {
+    let source_edges = bin_edges(&source.freqs_mhz)?;
+    let target_edges = bin_edges(target_freqs_mhz)?;
+    let mut rebinned = Vec::with_capacity(target_freqs_mhz.len());
+    let mut source_idx = 0usize;
+
+    for target_idx in 0..target_freqs_mhz.len() {
+        let low = target_edges[target_idx];
+        let high = target_edges[target_idx + 1];
+        let target_width = high - low;
+        while source_idx < source.values.len() && source_edges[source_idx + 1] <= low {
+            source_idx += 1;
+        }
+
+        let mut idx = source_idx;
+        let mut weighted_sum = 0.0f32;
+        let mut covered_width = 0.0f32;
+        while idx < source.values.len() && source_edges[idx] < high {
+            let overlap = high.min(source_edges[idx + 1]) - low.max(source_edges[idx]);
+            if overlap > 0.0 {
+                weighted_sum += source.values[idx] * overlap;
+                covered_width += overlap;
+            }
+            idx += 1;
+        }
+
+        let fully_covered = covered_width + target_width * 1.0e-4 >= target_width;
+        if fully_covered && covered_width > 0.0 {
+            rebinned.push(Some(weighted_sum / covered_width));
+        } else {
+            rebinned.push(None);
+        }
+    }
+
+    Ok(rebinned)
+}
+
+fn calibrate_bandpass(
+    data: &Spectrum,
+    bandpass: &Spectrum,
+) -> Result<(Spectrum, RebinDirection), DynError> {
+    if same_frequency_grid(&data.freqs_mhz, &bandpass.freqs_mhz) {
+        let values = data
+            .values
+            .iter()
+            .zip(&bandpass.values)
+            .enumerate()
+            .map(|(idx, (&value, &bp))| {
+                if bp <= 0.0 {
+                    Err(format!("bandpass channel {idx} must be greater than zero").into())
+                } else {
+                    Ok(value / bp)
+                }
+            })
+            .collect::<Result<Vec<_>, DynError>>()?;
+        return Ok((
+            Spectrum {
+                freqs_mhz: data.freqs_mhz.clone(),
+                values,
+            },
+            RebinDirection::None,
+        ));
+    }
+
+    let data_is_coarser =
+        mean_channel_width(&data.freqs_mhz) >= mean_channel_width(&bandpass.freqs_mhz);
+    let (target, rebinned, direction, data_on_target) = if data_is_coarser {
+        (
+            data,
+            rebin_onto(bandpass, &data.freqs_mhz)?,
+            RebinDirection::BandpassToData,
+            true,
+        )
+    } else {
+        (
+            bandpass,
+            rebin_onto(data, &bandpass.freqs_mhz)?,
+            RebinDirection::DataToBandpass,
+            false,
+        )
+    };
+
+    let mut freqs_mhz = Vec::with_capacity(target.freqs_mhz.len());
+    let mut values = Vec::with_capacity(target.values.len());
+    for (idx, rebinned_value) in rebinned.into_iter().enumerate() {
+        let Some(rebinned_value) = rebinned_value else {
+            continue;
+        };
+        let (data_value, bp_value) = if data_on_target {
+            (target.values[idx], rebinned_value)
+        } else {
+            (rebinned_value, target.values[idx])
+        };
+        if bp_value <= 0.0 {
+            return Err(format!(
+                "bandpass at {:.9} MHz must be greater than zero",
+                target.freqs_mhz[idx]
+            )
+            .into());
+        }
+        freqs_mhz.push(target.freqs_mhz[idx]);
+        values.push(data_value / bp_value);
+    }
+
+    if freqs_mhz.len() < 2 {
+        return Err(
+            "data and bandpass tables have fewer than two fully overlapping channels".into(),
+        );
+    }
+
+    Ok((Spectrum { freqs_mhz, values }, direction))
+}
+
 fn plot_spectrum(
     freqs_mhz: &[f32],
     power: &[f32],
@@ -601,6 +831,7 @@ fn save_spectrum_text(
     cli: &Cli,
     if_range: (f32, f32),
     frames: u64,
+    calibration_rebin: Option<RebinDirection>,
 ) -> Result<(), DynError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -618,6 +849,14 @@ fn save_spectrum_text(
     writeln!(writer, "# skip      : {:.6} s", cli.skip)?;
     if let Some(length) = cli.length {
         writeln!(writer, "# length    : {:.6} s", length)?;
+    }
+    if let Some(path) = cli.bptable.as_deref() {
+        writeln!(writer, "# bptable   : {}", path.display())?;
+        writeln!(
+            writer,
+            "# calibration: power / bandpass ({})",
+            calibration_rebin.unwrap_or(RebinDirection::None)
+        )?;
     }
     writeln!(writer, "# loop      : {}", cli.loop_count)?;
     writeln!(writer, "# integrated frames: {}", frames)?;
@@ -726,6 +965,12 @@ fn main() -> Result<(), IoError> {
     };
     let decode_plan = build_decode_plan(cli.bit, &shuffle, &levels)
         .map_err(|e| IoError::new(ErrorKind::InvalidInput, e.to_string()))?;
+    let bandpass = cli
+        .bptable
+        .as_deref()
+        .map(read_spectrum_table)
+        .transpose()
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
     let frame_bits = cli.fft * cli.bit;
     if frame_bits % 32 != 0 {
@@ -822,6 +1067,13 @@ fn main() -> Result<(), IoError> {
         selected_low, selected_high
     );
     println!("  sideband         : {}", cli.sideband);
+    if let Some(path) = cli.bptable.as_deref() {
+        println!("  bptable          : {}", path.display());
+        println!(
+            "  bptable channels : {}",
+            bandpass.as_ref().map_or(0, |table| table.values.len())
+        );
+    }
     println!("  skip             : {:.6} s", cli.skip);
     if let Some(length) = cli.length {
         println!("  length           : {:.6} s", length);
@@ -837,7 +1089,7 @@ fn main() -> Result<(), IoError> {
     let pool = ThreadPoolBuilder::new()
         .num_threads(cli.cpu)
         .build()
-        .map_err(|e| IoError::new(ErrorKind::Other, format!("failed to configure rayon: {e}")))?;
+        .map_err(|e| IoError::other(format!("failed to configure rayon: {e}")))?;
     let mut planner = RealFftPlanner::<f32>::new();
     let forward = planner.plan_fft_forward(cli.fft);
 
@@ -891,7 +1143,7 @@ fn main() -> Result<(), IoError> {
                             },
                         )
                 })
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| IoError::other(e.to_string()))?;
 
             for (dst, src) in integrated.iter_mut().zip(chunk_accum.iter()) {
                 *dst += *src;
@@ -918,27 +1170,109 @@ fn main() -> Result<(), IoError> {
             *v *= inv;
         }
 
-        let power = integrated[start_bin..end_bin].to_vec();
+        let raw_spectrum = Spectrum {
+            freqs_mhz: freqs_mhz.clone(),
+            values: integrated[start_bin..end_bin].to_vec(),
+        };
+        let (output_spectrum, calibration_rebin) = if let Some(table) = bandpass.as_ref() {
+            let (calibrated, direction) = calibrate_bandpass(&raw_spectrum, table)
+                .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+            println!("  bptable rebin    : {direction}");
+            (calibrated, Some(direction))
+        } else {
+            (raw_spectrum, None)
+        };
+        let output_if_range = if calibration_rebin.is_some() {
+            (
+                output_spectrum.freqs_mhz[0],
+                output_spectrum.freqs_mhz[output_spectrum.freqs_mhz.len() - 1],
+            )
+        } else {
+            if_range_selected
+        };
 
         let plot_path = resolve_plot_path(&cli.vdif, seg_idx, segment_total);
-        plot_spectrum(&freqs_mhz, &power, &plot_path, if_range_selected)
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+        plot_spectrum(
+            &output_spectrum.freqs_mhz,
+            &output_spectrum.values,
+            &plot_path,
+            output_if_range,
+        )
+        .map_err(|e| IoError::other(e.to_string()))?;
         println!("  plot             : {}", plot_path.display());
 
         if let Some(txt_path) = resolve_text_path(&cli.vdif, &cli.output, seg_idx, segment_total) {
             save_spectrum_text(
                 &txt_path,
-                &freqs_mhz,
-                &power,
+                &output_spectrum.freqs_mhz,
+                &output_spectrum.values,
                 &cli,
-                if_range_selected,
+                output_if_range,
                 segment_frames,
+                calibration_rebin,
             )
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| IoError::other(e.to_string()))?;
             println!("  output txt       : {}", txt_path.display());
         }
     }
 
     println!("  done             : {}", cli.vdif.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn spectrum(freqs_mhz: &[f32], values: &[f32]) -> Spectrum {
+        Spectrum {
+            freqs_mhz: freqs_mhz.to_vec(),
+            values: values.to_vec(),
+        }
+    }
+
+    fn assert_values_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn parses_output_table_with_comments() {
+        let input = b"# spectrum\n1.0 2.0\n2.0 4.0 # inline\n";
+        let parsed = parse_spectrum_table(Cursor::new(input), "test").unwrap();
+        assert_values_close(&parsed.freqs_mhz, &[1.0, 2.0]);
+        assert_values_close(&parsed.values, &[2.0, 4.0]);
+    }
+
+    #[test]
+    fn divides_matching_channels_directly() {
+        let data = spectrum(&[1.0, 2.0], &[10.0, 20.0]);
+        let bandpass = spectrum(&[1.0, 2.0], &[2.0, 4.0]);
+        let (calibrated, direction) = calibrate_bandpass(&data, &bandpass).unwrap();
+        assert_eq!(direction, RebinDirection::None);
+        assert_values_close(&calibrated.values, &[5.0, 5.0]);
+    }
+
+    #[test]
+    fn rebins_fine_bandpass_to_coarse_data() {
+        let data = spectrum(&[1.0, 3.0], &[10.0, 20.0]);
+        let bandpass = spectrum(&[0.5, 1.5, 2.5, 3.5], &[2.0, 2.0, 4.0, 4.0]);
+        let (calibrated, direction) = calibrate_bandpass(&data, &bandpass).unwrap();
+        assert_eq!(direction, RebinDirection::BandpassToData);
+        assert_values_close(&calibrated.freqs_mhz, &[1.0, 3.0]);
+        assert_values_close(&calibrated.values, &[5.0, 5.0]);
+    }
+
+    #[test]
+    fn rebins_fine_data_to_coarse_bandpass() {
+        let data = spectrum(&[0.5, 1.5, 2.5, 3.5], &[10.0, 10.0, 20.0, 20.0]);
+        let bandpass = spectrum(&[1.0, 3.0], &[2.0, 4.0]);
+        let (calibrated, direction) = calibrate_bandpass(&data, &bandpass).unwrap();
+        assert_eq!(direction, RebinDirection::DataToBandpass);
+        assert_values_close(&calibrated.freqs_mhz, &[1.0, 3.0]);
+        assert_values_close(&calibrated.values, &[5.0, 5.0]);
+    }
 }
