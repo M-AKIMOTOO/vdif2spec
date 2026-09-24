@@ -99,6 +99,9 @@ struct Cli {
     #[arg(long, help = "Force VSREC decode map (--shuffle/--level override)")]
     vsrec: bool,
 
+    #[arg(long, help = "Skip PNG plotting and quantization")]
+    no_plot: bool,
+
     #[arg(
         long = "bw",
         default_value_t = 1024.0,
@@ -122,7 +125,7 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 1,
+        default_value_t = std::thread::available_parallelism().map_or(1, usize::from),
         value_name = "N",
         help = "CPU worker threads"
     )]
@@ -157,7 +160,7 @@ enum ShuffleKind {
 struct DecodePlan {
     bits: usize,
     shuffle_kind: ShuffleKind,
-    input_shifts: [u32; 32],
+    word_shuffle_lut: Option<Box<[[u32; 256]; 4]>>,
     byte_lut: Option<ByteDecodeLut>,
 }
 
@@ -272,13 +275,54 @@ fn build_decode_plan(
     };
 
     let byte_lut = build_byte_decode_lut(bits, shuffle_kind, levels);
+    let word_shuffle_lut = build_word_shuffle_lut(&input_shifts, shuffle_kind);
 
     Ok(DecodePlan {
         bits,
         shuffle_kind,
-        input_shifts,
+        word_shuffle_lut,
         byte_lut,
     })
+}
+
+fn build_word_shuffle_lut(
+    input_shifts: &[u32; 32],
+    shuffle_kind: ShuffleKind,
+) -> Option<Box<[[u32; 256]; 4]>> {
+    if shuffle_kind != ShuffleKind::Generic {
+        return None;
+    }
+
+    let mut table = [[0u32; 256]; 4];
+    for (input_byte, row) in table.iter_mut().enumerate() {
+        for (byte_value, output_word) in row.iter_mut().enumerate() {
+            for (output_bit, &input_bit) in input_shifts.iter().enumerate() {
+                let source_byte = (input_bit / 8) as usize;
+                if source_byte == input_byte {
+                    let bit = (byte_value as u32 >> (input_bit & 7)) & 1;
+                    *output_word |= bit << output_bit;
+                }
+            }
+        }
+    }
+    Some(Box::new(table))
+}
+
+fn shuffle_word(word: u32, plan: &DecodePlan) -> u32 {
+    match plan.shuffle_kind {
+        ShuffleKind::Identity => word,
+        ShuffleKind::PairSwap => ((word & 0xAAAA_AAAA) >> 1) | ((word & 0x5555_5555) << 1),
+        ShuffleKind::Generic => {
+            let table = plan
+                .word_shuffle_lut
+                .as_ref()
+                .expect("generic shuffle plan has a lookup table");
+            table[0][(word & 0xff) as usize]
+                | table[1][((word >> 8) & 0xff) as usize]
+                | table[2][((word >> 16) & 0xff) as usize]
+                | table[3][(word >> 24) as usize]
+        }
+    }
 }
 
 fn build_byte_decode_lut(
@@ -347,17 +391,10 @@ fn decode_block_into_with_plan(
     let mut acc_bits = 0usize;
 
     for chunk in raw.chunks_exact(4) {
-        let mut word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-
-        if plan.shuffle_kind == ShuffleKind::PairSwap {
-            word = ((word & 0xAAAA_AAAA) >> 1) | ((word & 0x5555_5555) << 1);
-        } else if plan.shuffle_kind == ShuffleKind::Generic {
-            let mut shuffled = 0u32;
-            for (out_bit, &in_shift) in plan.input_shifts.iter().enumerate() {
-                shuffled |= ((word >> in_shift) & 1) << out_bit;
-            }
-            word = shuffled;
-        }
+        let word = shuffle_word(
+            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            plan,
+        );
 
         acc |= (word as u64) << acc_bits;
         acc_bits += 32;
@@ -394,12 +431,8 @@ fn decode_block_with_byte_lut(
 
     for chunk in raw.chunks_exact(4) {
         let bytes = if plan.shuffle_kind == ShuffleKind::Generic {
-            let mut shuffled = 0u32;
             let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            for (out_bit, &in_shift) in plan.input_shifts.iter().enumerate() {
-                shuffled |= ((word >> in_shift) & 1) << out_bit;
-            }
-            shuffled.to_le_bytes()
+            shuffle_word(word, plan).to_le_bytes()
         } else {
             [chunk[0], chunk[1], chunk[2], chunk[3]]
         };
@@ -787,7 +820,7 @@ fn quantize_png_in_place(path: &Path) -> Result<(), DynError> {
     let mut liq = imagequant::new();
     liq.set_max_colors(16)?;
     liq.set_quality(0, 35)?;
-    liq.set_speed(1)?;
+    liq.set_speed(10)?;
 
     let mut img = liq.new_image(rgba_pixels, width as usize, height as usize, 0.0)?;
     let mut res = liq.quantize(&mut img)?;
@@ -800,7 +833,7 @@ fn quantize_png_in_place(path: &Path) -> Result<(), DynError> {
     let mut encoder = png::Encoder::new(writer, width, height);
     encoder.set_color(png::ColorType::Indexed);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Best);
+    encoder.set_compression(png::Compression::Fast);
 
     let mut pal_rgb = Vec::with_capacity(palette.len() * 3);
     let mut pal_alpha = Vec::with_capacity(palette.len());
@@ -875,6 +908,12 @@ fn save_spectrum_text(
 
 fn main() -> Result<(), IoError> {
     let mut cli = Cli::parse();
+    if cli.no_plot && cli.output.is_none() {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "--no-plot requires --output so the spectrum is saved",
+        ));
+    }
     if cli.vsrec {
         if cli.bit != 2 {
             return Err(IoError::new(
@@ -1192,14 +1231,16 @@ fn main() -> Result<(), IoError> {
         };
 
         let plot_path = resolve_plot_path(&cli.vdif, seg_idx, segment_total);
-        plot_spectrum(
-            &output_spectrum.freqs_mhz,
-            &output_spectrum.values,
-            &plot_path,
-            output_if_range,
-        )
-        .map_err(|e| IoError::other(e.to_string()))?;
-        println!("  plot             : {}", plot_path.display());
+        if !cli.no_plot {
+            plot_spectrum(
+                &output_spectrum.freqs_mhz,
+                &output_spectrum.values,
+                &plot_path,
+                output_if_range,
+            )
+            .map_err(|e| IoError::other(e.to_string()))?;
+            println!("  plot             : {}", plot_path.display());
+        }
 
         if let Some(txt_path) = resolve_text_path(&cli.vdif, &cli.output, seg_idx, segment_total) {
             save_spectrum_text(

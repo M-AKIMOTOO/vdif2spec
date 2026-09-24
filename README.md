@@ -6,7 +6,7 @@ VDIF/raw の周波数スペクトルを作成します。
 - 周波数軸は `0 .. --bw/2 [MHz]`
 - `--if LOW-HIGH` で IF 範囲を抽出
 - `--bptable FILE` でチャンネルごとのバンドパス較正
-- `--cpu` で Rayon 並列実行
+- `--cpu` で Rayon 並列実行（既定値は OS が報告する利用可能スレッド数）
 
 ## Build
 
@@ -35,16 +35,17 @@ vdif2spec --vdif <FILE> [OPTIONS]
 - `--if <LOW> <HIGH>`: IF 抽出範囲
 - `--bptable <FILE>`: 2列テキストのバンドパステーブルで `power / bandpass` 較正
 - `--sideband <USB|LSB>`: 入力 sideband
-- `--cpu <N>`: Rayon スレッド数
+- `--cpu <N>`: Rayon スレッド数（既定値は利用可能な並列数）
+- `--no-plot`: PNG描画を省略し、`--output` のテキストだけを保存
 - `-o, --output [FILE]`: テキスト保存
 
 ## Output
 
-PNG は常に出力されます:
+通常は PNG を出力します。`--no-plot` を指定すると PNG 描画と減色処理を省略できます（この場合 `--output` が必要です）:
 
 - `<input_dir>/vdif2spec/<stem>_vdif2spec_spec.png`
 - `--loop > 0` のときは `<stem>_vdif2spec_spec_loop0001.png` のように連番出力
-- 生成後に `imagequant` で自動減色（indexed PNG 化）し、ファイル容量を最小化します
+- 生成後に `imagequant` で減色（indexed PNG 化）します。処理速度を優先する設定のため、圧縮後のファイルは大きくなる場合があります
 
 テキスト出力 (`frequency[MHz] power[a.u.]`) は `-o/--output` 指定時のみ:
 
@@ -97,4 +98,13 @@ IF 抽出 + 任意テキスト名:
   --vdif ./test/HITACH32_2024058103800.vdif2spec \
   --fft 4096 --bw 1024 --if 60 100 \
   --bptable ./bandpass.txt --output ./calibrated.txt
+```
+
+テキストのみ高速出力:
+
+```bash
+./target/release/vdif2spec \
+  --vdif ./test/HITACH32_2024058103800.vdif2spec \
+  --fft 4096 --bw 1024 --if 60 100 \
+  --bptable ./bandpass.txt --output ./calibrated.txt --no-plot
 ```
