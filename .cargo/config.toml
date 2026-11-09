@@ -1,0 +1,3 @@
+[build]
+# Detect the CPU on the machine running Cargo instead of fixing a CPU model or ISA.
+rustflags = ["-C", "target-cpu=native"]

@@ -12,7 +12,10 @@ use std::io::{
     BufRead, BufReader, BufWriter, Error as IoError, ErrorKind, Read, Seek, SeekFrom, Write,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+mod irisxe;
 
 const DEFAULT_LEVELS_2BIT: [f32; 4] = [-1.5, 0.5, -0.5, 1.5];
 const DEFAULT_SHUFFLE_EXTERNAL: [usize; 32] = [
@@ -103,6 +106,12 @@ struct Cli {
     no_plot: bool,
 
     #[arg(
+        long,
+        help = "Use Intel Iris Xe integrated GPU via OpenCL for batched FFTs"
+    )]
+    irisxe: bool,
+
+    #[arg(
         long = "bw",
         default_value_t = 1024.0,
         value_name = "MHz",
@@ -154,6 +163,7 @@ struct Cli {
 enum ShuffleKind {
     Identity,
     PairSwap,
+    ByteReverse,
     Generic,
 }
 
@@ -175,6 +185,7 @@ struct FftWorker {
     forward: Arc<dyn RealToComplex<f32>>,
     time: Vec<f32>,
     spec: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
     accum: Vec<f32>,
 }
 
@@ -182,12 +193,95 @@ impl FftWorker {
     fn new(forward: Arc<dyn RealToComplex<f32>>, half_bins: usize) -> Self {
         let fft = forward.len();
         let spec = forward.make_output_vec();
+        let scratch = forward.make_scratch_vec();
         Self {
             forward,
             time: vec![0.0; fft],
             spec,
+            scratch,
             accum: vec![0.0; half_bins],
         }
+    }
+
+    fn accumulate_frame(
+        &mut self,
+        raw: &[u8],
+        levels: &[f32],
+        plan: &DecodePlan,
+        input_lsb: bool,
+    ) -> Result<(), DynError> {
+        decode_block_into_with_plan(
+            raw,
+            levels,
+            self.time.len(),
+            plan,
+            &mut self.time,
+            input_lsb,
+        )?;
+        self.forward
+            .process_with_scratch(&mut self.time, &mut self.spec, &mut self.scratch)?;
+        for (dst, src) in self.accum.iter_mut().zip(&self.spec) {
+            *dst += src.norm_sqr();
+        }
+        Ok(())
+    }
+}
+
+struct CpuFft {
+    workers: Vec<FftWorker>,
+    frame_bytes: usize,
+    power: Vec<f32>,
+}
+
+impl CpuFft {
+    fn new(forward: Arc<dyn RealToComplex<f32>>, frame_bytes: usize, workers: usize) -> Self {
+        let half_bins = forward.len() / 2;
+        Self {
+            workers: (0..workers)
+                .map(|_| FftWorker::new(forward.clone(), half_bins))
+                .collect(),
+            frame_bytes,
+            power: vec![0.0; half_bins],
+        }
+    }
+
+    fn process(
+        &mut self,
+        pool: &rayon::ThreadPool,
+        raw: &[u8],
+        levels: &[f32],
+        plan: &DecodePlan,
+        input_lsb: bool,
+    ) -> Result<&[f32], DynError> {
+        let frames = raw.len() / self.frame_bytes;
+        let next_frame = AtomicUsize::new(0);
+        // Small batches balance P/E cores while keeping each worker's buffers hot.
+        const TASK_FRAMES: usize = 16;
+        pool.install(|| {
+            self.workers.par_iter_mut().try_for_each(|worker| {
+                worker.accum.fill(0.0);
+                loop {
+                    let first = next_frame.fetch_add(TASK_FRAMES, Ordering::Relaxed);
+                    if first >= frames {
+                        break;
+                    }
+                    let last = (first + TASK_FRAMES).min(frames);
+                    for frame in raw[first * self.frame_bytes..last * self.frame_bytes]
+                        .chunks_exact(self.frame_bytes)
+                    {
+                        worker.accumulate_frame(frame, levels, plan, input_lsb)?;
+                    }
+                }
+                Ok::<(), DynError>(())
+            })
+        })?;
+        self.power.fill(0.0);
+        for worker in &self.workers {
+            for (dst, &src) in self.power.iter_mut().zip(&worker.accum) {
+                *dst += src;
+            }
+        }
+        Ok(&self.power)
     }
 }
 
@@ -266,10 +360,13 @@ fn build_decode_plan(
 
     let is_identity = shuffle_in.iter().enumerate().all(|(i, &v)| i == v);
     let is_pair_swap = shuffle_in.iter().enumerate().all(|(i, &v)| (i ^ 1) == v);
+    let is_byte_reverse = shuffle_in.iter().enumerate().all(|(i, &v)| (i ^ 7) == v);
     let shuffle_kind = if is_identity {
         ShuffleKind::Identity
     } else if is_pair_swap {
         ShuffleKind::PairSwap
+    } else if is_byte_reverse {
+        ShuffleKind::ByteReverse
     } else {
         ShuffleKind::Generic
     };
@@ -312,6 +409,7 @@ fn shuffle_word(word: u32, plan: &DecodePlan) -> u32 {
     match plan.shuffle_kind {
         ShuffleKind::Identity => word,
         ShuffleKind::PairSwap => ((word & 0xAAAA_AAAA) >> 1) | ((word & 0x5555_5555) << 1),
+        ShuffleKind::ByteReverse => word.reverse_bits().swap_bytes(),
         ShuffleKind::Generic => {
             let table = plan
                 .word_shuffle_lut
@@ -341,10 +439,10 @@ fn build_byte_decode_lut(
     let mut table_odd = [[0.0f32; 8]; 256];
 
     for byte in 0u16..=255 {
-        let source = if shuffle_kind == ShuffleKind::PairSwap {
-            ((byte & 0xAA) >> 1) | ((byte & 0x55) << 1)
-        } else {
-            byte
+        let source = match shuffle_kind {
+            ShuffleKind::PairSwap => ((byte & 0xAA) >> 1) | ((byte & 0x55) << 1),
+            ShuffleKind::ByteReverse => (byte as u8).reverse_bits() as u16,
+            _ => byte,
         };
 
         for sample_idx in 0..samples_per_byte {
@@ -427,6 +525,19 @@ fn decode_block_with_byte_lut(
     lsb_to_usb: bool,
     lut: &ByteDecodeLut,
 ) -> Result<(), DynError> {
+    if raw.len() % 4 == 0 && raw.len().checked_mul(lut.samples_per_byte) == Some(samples) {
+        let output = &mut output[..samples];
+        // Fixed-size copies remove per-sample branches and let LLVM use vector loads/stores.
+        match lut.samples_per_byte {
+            8 => decode_bytes_exact::<8>(raw, plan, output, lsb_to_usb, lut),
+            4 => decode_bytes_exact::<4>(raw, plan, output, lsb_to_usb, lut),
+            2 => decode_bytes_exact::<2>(raw, plan, output, lsb_to_usb, lut),
+            1 => decode_bytes_exact::<1>(raw, plan, output, lsb_to_usb, lut),
+            _ => unreachable!("byte LUT has 1, 2, 4 or 8 samples per byte"),
+        }
+        return Ok(());
+    }
+
     let mut out_idx = 0usize;
 
     for chunk in raw.chunks_exact(4) {
@@ -461,6 +572,46 @@ fn decode_block_with_byte_lut(
     }
 
     Ok(())
+}
+
+fn decode_bytes_exact<const N: usize>(
+    raw: &[u8],
+    plan: &DecodePlan,
+    output: &mut [f32],
+    input_lsb: bool,
+    lut: &ByteDecodeLut,
+) {
+    let table = if input_lsb {
+        &lut.table_even
+    } else {
+        &lut.table_plain
+    };
+    if plan.shuffle_kind == ShuffleKind::Generic {
+        for (raw_word, dst) in raw.chunks_exact(4).zip(output.chunks_exact_mut(4 * N)) {
+            let bytes = shuffle_word(
+                u32::from_le_bytes(raw_word.try_into().expect("four-byte word")),
+                plan,
+            )
+            .to_le_bytes();
+            for (i, (&byte, samples)) in bytes.iter().zip(dst.chunks_exact_mut(N)).enumerate() {
+                let row = if input_lsb && N == 1 && (i & 1) == 1 {
+                    &lut.table_odd[byte as usize]
+                } else {
+                    &table[byte as usize]
+                };
+                samples.copy_from_slice(&row[..N]);
+            }
+        }
+    } else if input_lsb && N == 1 {
+        for (bytes, dst) in raw.chunks_exact(2).zip(output.chunks_exact_mut(2)) {
+            dst[0] = lut.table_even[bytes[0] as usize][0];
+            dst[1] = lut.table_odd[bytes[1] as usize][0];
+        }
+    } else {
+        for (&byte, samples) in raw.iter().zip(output.chunks_exact_mut(N)) {
+            samples.copy_from_slice(&table[byte as usize][..N]);
+        }
+    }
 }
 
 fn resolve_plot_path(vdif: &Path, segment_idx: usize, segment_total: u64) -> PathBuf {
@@ -1129,11 +1280,32 @@ fn main() -> Result<(), IoError> {
         .num_threads(cli.cpu)
         .build()
         .map_err(|e| IoError::other(format!("failed to configure rayon: {e}")))?;
-    let mut planner = RealFftPlanner::<f32>::new();
-    let forward = planner.plan_fft_forward(cli.fft);
+    let chunk_frames = (cli.progress_every as usize)
+        .max(cli.cpu * 16)
+        .min((64 * 1024 * 1024 / frame_bytes).max(1))
+        .min(segment_frames.min(usize::MAX as u64) as usize)
+        .max(1);
+    let mut cpu_fft = if cli.irisxe {
+        None
+    } else {
+        let mut planner = RealFftPlanner::<f32>::new();
+        Some(CpuFft::new(
+            planner.plan_fft_forward(cli.fft),
+            frame_bytes,
+            cli.cpu.min(chunk_frames.div_ceil(16)),
+        ))
+    };
+    let mut irisxe = if cli.irisxe {
+        Some(irisxe::IrisXeFft::new(cli.fft).map_err(IoError::other)?)
+    } else {
+        None
+    };
 
-    let chunk_frames = (cli.progress_every as usize).max(cli.cpu * 16).max(1);
     let mut in_chunk = vec![0u8; chunk_frames * frame_bytes];
+    let mut gpu_decode = irisxe
+        .as_ref()
+        .map(|gpu| vec![0.0f32; gpu.batch_frames() * cli.fft]);
+    let mut gpu_power = irisxe.as_ref().map(|_| vec![0.0f32; half_bins]);
     let input_lsb = cli.sideband == Sideband::Lsb;
     let freqs_mhz: Vec<f32> = (start_bin..end_bin)
         .map(|k| (k as f32) * (bw_half_mhz as f32) / (half_bins as f32))
@@ -1143,53 +1315,73 @@ fn main() -> Result<(), IoError> {
     for seg_idx in 0..segment_total as usize {
         let mut integrated = vec![0.0f32; half_bins];
         let mut done_frames = 0u64;
+        let mut next_progress = cli.progress_every;
 
         while done_frames < segment_frames {
             let this_chunk = ((segment_frames - done_frames) as usize).min(chunk_frames);
             let in_bytes = this_chunk * frame_bytes;
             reader.read_exact(&mut in_chunk[..in_bytes])?;
 
-            let chunk_accum = pool
-                .install(|| -> Result<Vec<f32>, DynError> {
-                    in_chunk[..in_bytes]
-                        .par_chunks(frame_bytes)
-                        .try_fold(
-                            || FftWorker::new(forward.clone(), half_bins),
-                            |mut worker, raw_frame| {
+            let chunk_accum = if let Some(gpu) = irisxe.as_mut() {
+                let batch_capacity = gpu.batch_frames();
+                let decoded = gpu_decode
+                    .as_mut()
+                    .expect("GPU decode buffer is initialized");
+                let total = gpu_power.as_mut().expect("GPU power buffer is initialized");
+                total.fill(0.0);
+                let mut offset = 0usize;
+                while offset < this_chunk {
+                    let batch_frames = (this_chunk - offset).min(batch_capacity);
+                    let raw_start = offset * frame_bytes;
+                    let raw_end = raw_start + batch_frames * frame_bytes;
+                    let raw_batch = &in_chunk[raw_start..raw_end];
+                    let decoded_batch = &mut decoded[..batch_frames * cli.fft];
+                    pool.install(|| -> Result<(), DynError> {
+                        raw_batch
+                            .par_chunks_exact(frame_bytes)
+                            .zip(decoded_batch.par_chunks_mut(cli.fft))
+                            .try_for_each(|(raw_frame, output)| {
                                 decode_block_into_with_plan(
                                     raw_frame,
                                     &levels,
                                     cli.fft,
                                     &decode_plan,
-                                    &mut worker.time,
+                                    output,
                                     input_lsb,
-                                )?;
-                                worker.forward.process(&mut worker.time, &mut worker.spec)?;
-                                for (dst, src) in worker.accum.iter_mut().zip(worker.spec.iter()) {
-                                    *dst += src.norm_sqr();
-                                }
-                                Ok(worker)
-                            },
-                        )
-                        .map(|res| res.map(|worker| worker.accum))
-                        .try_reduce(
-                            || vec![0.0f32; half_bins],
-                            |mut a, b| {
-                                for (dst, src) in a.iter_mut().zip(b.iter()) {
-                                    *dst += *src;
-                                }
-                                Ok(a)
-                            },
-                        )
-                })
-                .map_err(|e| IoError::other(e.to_string()))?;
+                                )
+                            })
+                    })
+                    .map_err(|e| IoError::other(e.to_string()))?;
+                    let batch_power = gpu
+                        .process(decoded_batch, batch_frames)
+                        .map_err(IoError::other)?;
+                    for (dst, &src) in total.iter_mut().zip(batch_power) {
+                        *dst += src;
+                    }
+                    offset += batch_frames;
+                }
+                total.as_slice()
+            } else {
+                cpu_fft
+                    .as_mut()
+                    .expect("CPU FFT plan is initialized")
+                    .process(
+                        &pool,
+                        &in_chunk[..in_bytes],
+                        &levels,
+                        &decode_plan,
+                        input_lsb,
+                    )
+                    .map_err(|e| IoError::other(e.to_string()))?
+            };
 
             for (dst, src) in integrated.iter_mut().zip(chunk_accum.iter()) {
                 *dst += *src;
             }
 
             done_frames += this_chunk as u64;
-            if done_frames % cli.progress_every == 0 || done_frames == segment_frames {
+            if done_frames >= next_progress || done_frames == segment_frames {
+                next_progress = done_frames.saturating_add(cli.progress_every);
                 let pct = (done_frames as f64 / segment_frames as f64) * 100.0;
                 print!(
                     "\r  progress [{}/{}]  : {done_frames}/{segment_frames} frames ({pct:.2}%)",
@@ -1277,6 +1469,147 @@ mod tests {
         assert_eq!(actual.len(), expected.len());
         for (&actual, &expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+        }
+    }
+
+    fn reference_decode(
+        raw: &[u8],
+        bits: usize,
+        shuffle: &[usize],
+        levels: &[f32],
+        samples: usize,
+        input_lsb: bool,
+    ) -> Vec<f32> {
+        (0..samples)
+            .map(|sample| {
+                let mut code = 0;
+                for bit in 0..bits {
+                    let position = sample * bits + bit;
+                    let word_start = position / 32 * 4;
+                    let word =
+                        u32::from_le_bytes(raw[word_start..word_start + 4].try_into().unwrap());
+                    code |= (((word >> shuffle[position % 32]) & 1) as usize) << bit;
+                }
+                let value = levels[code];
+                if input_lsb && sample % 2 == 1 {
+                    -value
+                } else {
+                    value
+                }
+            })
+            .collect()
+    }
+
+    fn test_raw(bytes: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678u32;
+        (0..bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn optimized_decode_matches_bit_reference() {
+        let shuffles: Vec<Vec<usize>> = vec![
+            (0..32).collect(),
+            (0..32).map(|i| i ^ 1).collect(),
+            resolve_shuffle(&VSREC_SHUFFLE_EXTERNAL).unwrap(),
+            (0..32).map(|i| (i * 5 + 7) % 32).collect(),
+        ];
+        for bits in 1..=8 {
+            let levels: Vec<f32> = (0..1usize << bits)
+                .map(|code| (code as f32 - 3.5) * 0.75)
+                .collect();
+            let samples = 4096;
+            let raw = test_raw(samples * bits / 8);
+            for shuffle in &shuffles {
+                let plan = build_decode_plan(bits, shuffle, &levels).unwrap();
+                for input_lsb in [false, true] {
+                    let mut actual = vec![f32::NAN; samples + 1];
+                    decode_block_into_with_plan(
+                        &raw,
+                        &levels,
+                        samples,
+                        &plan,
+                        &mut actual,
+                        input_lsb,
+                    )
+                    .unwrap();
+                    let expected =
+                        reference_decode(&raw, bits, shuffle, &levels, samples, input_lsb);
+                    assert_eq!(
+                        &actual[..samples],
+                        expected,
+                        "bits={bits}, shuffle={:?}, LSB={input_lsb}",
+                        plan.shuffle_kind
+                    );
+                    assert!(actual[samples].is_nan());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_handles_partial_output_and_rejects_short_input() {
+        for bits in [1, 2, 4, 8] {
+            let levels = resolve_levels(bits, &[]).unwrap();
+            let shuffle = resolve_shuffle(&VSREC_SHUFFLE_EXTERNAL).unwrap();
+            let plan = build_decode_plan(bits, &shuffle, &levels).unwrap();
+            let raw = test_raw(8);
+            let mut actual = vec![0.0; 7];
+            decode_block_into_with_plan(&raw, &levels, 7, &plan, &mut actual, true).unwrap();
+            assert_eq!(
+                actual,
+                reference_decode(&raw, bits, &shuffle, &levels, 7, true)
+            );
+            let mut too_long = vec![0.0; 64 / bits];
+            assert!(decode_block_into_with_plan(
+                &raw[..4],
+                &levels,
+                too_long.len(),
+                &plan,
+                &mut too_long,
+                true,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn reused_cpu_workers_match_direct_dft_across_chunks() {
+        let fft_len = 32;
+        let frame_bytes = fft_len / 4;
+        let levels = DEFAULT_LEVELS_2BIT;
+        let shuffle = resolve_shuffle(&VSREC_SHUFFLE_EXTERNAL).unwrap();
+        let plan = build_decode_plan(2, &shuffle, &levels).unwrap();
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut planner = RealFftPlanner::<f32>::new();
+        let mut cpu = CpuFft::new(planner.plan_fft_forward(fft_len), frame_bytes, 4);
+        // The second call must discard the first chunk's power and reuse all buffers.
+        for frames in [37, 3] {
+            let raw = test_raw(frames * frame_bytes);
+            let actual = cpu.process(&pool, &raw, &levels, &plan, true).unwrap();
+            let mut expected = vec![0.0f64; fft_len / 2];
+            for frame in raw.chunks_exact(frame_bytes) {
+                let samples = reference_decode(frame, 2, &shuffle, &levels, fft_len, true);
+                for (bin, power) in expected.iter_mut().enumerate() {
+                    let mut real = 0.0;
+                    let mut imag = 0.0;
+                    for (sample, &value) in samples.iter().enumerate() {
+                        let phase = std::f64::consts::TAU * (sample * bin) as f64 / fft_len as f64;
+                        real += value as f64 * phase.cos();
+                        imag -= value as f64 * phase.sin();
+                    }
+                    *power += real * real + imag * imag;
+                }
+            }
+            for (&actual, expected) in actual.iter().zip(expected) {
+                assert!((actual as f64 - expected).abs() < 1.0e-3 + expected * 2.0e-6);
+            }
         }
     }
 
